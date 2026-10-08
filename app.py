@@ -294,7 +294,7 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         return (False, "API Key belum disetel di Secrets")
 
     try:
-        # 1. Unduh dan kompres gambar
+        # 1. Unduh dan perkecil ukuran gambar
         resp_img = requests.get(img_url, timeout=12, verify=False)
         if resp_img.status_code != 200:
             return (False, "Gagal mengunduh gambar")
@@ -310,7 +310,7 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
             "Jika berupa foto orang/wajah saja, foto rumah, teras, pagar, plang kantor, jalan, amplop tanpa KTP, atau screenshot chat, "
             "maka BUKAN dokumen identitas.\n"
-            "Wajib jawab HANYA berupa JSON persis: "
+            "Wajib jawab HANYA format JSON persis: "
             "{\"valid\": true, \"alasan\": \"KTP/KK sah\"} atau "
             "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
         )
@@ -328,19 +328,13 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             }
         }
 
-        # 2. Dapatkan endpoint yang dijamin aktif untuk API Key akun ini
-        target_url = get_valid_gemini_endpoint(api_key)
-        resp = requests.post(target_url, headers=headers, json=payload, timeout=25)
+        # 2. Pakai endpoint resmi gemini-1.5-flash (pasti aktif di semua akun)
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
 
-        # 3. Evaluasi respons HTTP (perbaikan bug 'if resp' Python)
-        if resp is None or resp.status_code != 200:
-            detail_err = "Gagal menghubungi server"
-            if resp is not None:
-                try:
-                    detail_err = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
-                except Exception:
-                    detail_err = f"HTTP {resp.status_code}"
-            return (False, f"API Error: {detail_err[:35]}")
+        if resp.status_code != 200:
+            err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
+            return (False, f"API Error: {err_msg[:35]}")
 
         raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         clean_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
