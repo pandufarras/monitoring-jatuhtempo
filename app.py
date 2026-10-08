@@ -222,7 +222,6 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         img.save(buf, format="JPEG", quality=85)
         clean_jpg_bytes = buf.getvalue()
 
-        # Inisialisasi klien Gemini (google-genai SDK)
         from google import genai
         from google.genai import types
 
@@ -826,21 +825,31 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             img_ktp = f"<a href='{row['foto_ktp']}' target='_blank'><img src='{row['foto_ktp']}' style='width: 155px; height: 105px; object-fit: cover; border-radius: 6px; border: 1.5px solid #cbd5e1;'></a>" if row['foto_ktp'] else "<span style='color:#dc2626; font-size:11px; font-weight:bold;'>Tidak ada KTP/KK</span>"
 
             is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
+
+            # BARIS BERWARNA MERAH MUDA & BORDER MERAH BILA INVALID[cite: 1]
+            if is_valid:
+                row_bg = "#ffffff"
+                border_b = "1px solid #cbd5e1"
+                ket_style = "color: #334155; font-weight: 600;"
+            else:
+                row_bg = "#fee2e2"
+                border_b = "1px solid #fca5a5"
+                ket_style = "color: #991b1b; font-weight: 700;"
+
             badge_inv = '<div style="background-color: #86efac; color: #065f46; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #4ade80;">VALID</div>' if is_valid else '<div style="background-color: #fca5a5; color: #991b1b; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #f87171;">INVALID</div>'
             ket_txt = row["Penjelasan Invalid"] if str(row["Penjelasan Invalid"]).strip() else "-"
 
             table_rows.append(
-                f"<tr style='border-bottom: 1px solid #cbd5e1; background-color: #ffffff; font-size: 13px;'>"
+                f"<tr style='border-bottom: {border_b}; background-color: {row_bg}; font-size: 13px;'>"
                 f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
                 f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
-                # DIUBAH: Hanya alamat penerima saja tanpa nama penerima
                 f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><span style='color: #1e293b; font-size: 12px; font-weight: 500;'>{row['alamat penerima']}</span></td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_ktp}</td>"
                 f"<td style='padding: 10px 8px; text-align: center; min-width: 100px; border-right: 1px solid #e2e8f0;'>{badge_inv}</td>"
-                f"<td style='padding: 10px 10px; color: #334155; font-weight: 600; font-size: 12px; min-width: 160px;'>{ket_txt}</td>"
+                f"<td style='padding: 10px 10px; {ket_style} font-size: 12px; min-width: 160px;'>{ket_txt}</td>"
                 f"</tr>"
             )
 
@@ -849,7 +858,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             f"<div style='background-color: #ffffff; color: #000000; text-align: center; padding: 10px 6px; font-size: 16px; font-weight: 900; letter-spacing: 0.5px; border-bottom: 2px solid #111;'>{header_label}</div>"
             f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
             f"<thead><tr style='background-color: {header_bg}; color: #ffffff; font-size: 13px; text-align: center;'>"
-            # DIUBAH: Header diganti menjadi 'Alamat'
             f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
             f"</tr></thead>"
             f"<tbody>{''.join(table_rows)}</tbody>"
