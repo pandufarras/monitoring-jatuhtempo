@@ -252,6 +252,42 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # ========================================================
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
+# 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
+# ========================================================
+@st.cache_data(ttl=1800)
+def get_valid_gemini_endpoint(api_key: str) -> str:
+    """Mengambil model aktif langsung dari akun Google AI Studio."""
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            daftar = res.json().get("models", [])
+            # Cari model yang mendukung generateContent
+            nama_tersedia = [
+                m.get("name") for m in daftar 
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+            # Prioritaskan varian flash
+            for prioritas in [
+                "models/gemini-2.0-flash",
+                "models/gemini-2.0-flash-exp",
+                "models/gemini-1.5-flash",
+                "models/gemini-1.5-flash-latest",
+                "models/gemini-1.5-flash-8b",
+                "models/gemini-1.5-pro"
+            ]:
+                if prioritas in nama_tersedia:
+                    return f"https://generativelanguage.googleapis.com/v1beta/{prioritas}:generateContent?key={api_key}"
+            
+            # Jika tidak ada yang cocok di atas, ambil model pertama yang mendukung generateContent
+            if nama_tersedia:
+                return f"https://generativelanguage.googleapis.com/v1beta/{nama_tersedia[0]}:generateContent?key={api_key}"
+    except Exception:
+        pass
+    # Fallback default
+    return f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+
+
 def analyze_document_with_gemini(img_url: str) -> tuple:
     api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
     if not api_key:
@@ -292,22 +328,19 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             }
         }
 
-        # 2. Coba endpoint stabil: gemini-2.0-flash (v1beta) lalu fallback ke gemini-1.5-flash (v1)
-        endpoints = [
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
-            f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}",
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
-        ]
+        # 2. Dapatkan endpoint yang dijamin aktif untuk API Key akun ini
+        target_url = get_valid_gemini_endpoint(api_key)
+        resp = requests.post(target_url, headers=headers, json=payload, timeout=25)
 
-        resp = None
-        for url in endpoints:
-            resp = requests.post(url, headers=headers, json=payload, timeout=25)
-            if resp.status_code == 200:
-                break
-
+        # 3. Evaluasi respons HTTP (perbaikan bug 'if resp' Python)
         if resp is None or resp.status_code != 200:
-            err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}") if resp else "Gagal koneksi"
-            return (False, f"API Error: {err_msg[:35]}")
+            detail_err = "Gagal menghubungi server"
+            if resp is not None:
+                try:
+                    detail_err = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
+                except Exception:
+                    detail_err = f"HTTP {resp.status_code}"
+            return (False, f"API Error: {detail_err[:35]}")
 
         raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         clean_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
