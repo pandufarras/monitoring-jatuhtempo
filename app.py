@@ -253,23 +253,22 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
 def analyze_document_with_gemini(img_url: str) -> tuple:
-    """
-    Analisis visual presisi menggunakan Gemini REST API langsung via requests.
-    Bebas kendala ModuleNotFoundError / ImportError SDK.
-    """
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         return (False, "API Key Gemini belum disetel di secrets.toml")
 
     try:
-        # 1. Unduh dan konversi gambar ke JPEG Base64
+        # 1. Unduh dan kompres ukuran foto agar payload ringan & cepat
         resp_img = requests.get(img_url, timeout=12, verify=False)
         if resp_img.status_code != 200:
             return (False, "Gagal mengunduh gambar")
 
         img = Image.open(io.BytesIO(resp_img.content)).convert("RGB")
+        # Resize sisi terpanjang ke maks 800px untuk menghemat bandwidth
+        img.thumbnail((800, 800), Image.LANCZOS)
+        
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=80)
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
         prompt_text = (
@@ -283,39 +282,47 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
         )
 
-        # 2. Endpoint REST API resmi Google AI
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
-        headers = {"Content-Type": "application/json"}
+        # 2. Struktur Payload REST API Resmi (Wajib camelCase: inlineData & mimeType)
         payload = {
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
-                    {"text": prompt_text}
-                ]
-            }],
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/jpeg",
+                                "data": img_b64
+                            }
+                        },
+                        {
+                            "text": prompt_text
+                        }
+                    ]
+                }
+            ],
             "generationConfig": {
-                "response_mime_type": "application/json"
+                "responseMimeType": "application/json"
             }
         }
 
-        # 3. Request ke API Gemini
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=20)
+        # 3. Kirim ke model stable gemini-1.5-flash
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
         
-        # Fallback ke gemini-1.5-flash jika model 2.5 belum aktif pada key Anda
-        if resp.status_code == 404:
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=20)
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
 
         if resp.status_code != 200:
-            return (False, f"HTTP Error {resp.status_code}: {resp.text[:30]}")
+            try:
+                err_detail = resp.json().get("error", {}).get("message", resp.text[:40])
+                return (False, f"API Error: {err_detail[:35]}")
+            except Exception:
+                return (False, f"HTTP {resp.status_code}")
 
         res_json = resp.json()
         raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
-        
-        # Bersihkan format JSON
+
         teks_clean = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
         data = json.loads(teks_clean)
-        
+
         is_v = bool(data.get("valid", False))
         alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
         return (is_v, alasan)
