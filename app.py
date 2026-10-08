@@ -36,8 +36,8 @@ def check_login():
 
     # Ambil kredensial dari secrets atau fallback default jika belum disetel
     cfg_auth = st.secrets.get("credentials", {})
-    valid_user = cfg_auth.get("username", "admin")
-    valid_pass = cfg_auth.get("password", "posind69200")
+    valid_user = cfg_auth.get("username")
+    valid_pass = cfg_auth.get("password")
 
     # Tampilan form login sederhana dan rapi di tengah
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -70,8 +70,8 @@ if st.sidebar.button("🚪 Keluar (Logout)"):
 URL_ES = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
 HEADERS_ES = {"Content-Type": "application/json", "kbn-xsrf": "true"}
 
-AUTH_USER = st.secrets.get("ES_USER", "upt")
-AUTH_PASS = st.secrets.get("ES_PASS", "posind3m4s")
+AUTH_USER = st.secrets.get("ES_USER")
+AUTH_PASS = st.secrets.get("ES_PASS")
 AUTH_ES = (AUTH_USER, AUTH_PASS)
 
 
