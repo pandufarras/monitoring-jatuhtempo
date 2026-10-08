@@ -11,7 +11,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import urllib3
-from google.genai import types
 
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
