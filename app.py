@@ -1,5 +1,7 @@
+import base64
 import datetime
 import json
+import urllib.parse
 import pandas as pd
 import requests
 import streamlit as st
@@ -15,13 +17,22 @@ st.set_page_config(
     layout="wide"
 )
 
-# Endpoint & Kredensial Elasticsearch Mile App (Aman dengan fallback secrets)
+# Endpoint & Kredensial Elasticsearch Mile App
 URL = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
 HEADERS = {"Content-Type": "application/json", "kbn-xsrf": "true"}
 
 AUTH_USER = st.secrets.get("ES_USER", "upt")
 AUTH_PASS = st.secrets.get("ES_PASS", "posind3m4s")
 AUTH = (AUTH_USER, AUTH_PASS)
+
+
+def generate_pid_url(connote_str: str) -> str:
+    """Mengubah nomor connote menjadi URL lacakan PID dengan Base64 + URL encode."""
+    if not connote_str or connote_str == "-":
+        return ""
+    b64_val = base64.b64encode(str(connote_str).strip().encode("utf-8")).decode("utf-8")
+    param_val = urllib.parse.quote(b64_val)
+    return f"https://pid.posindonesia.co.id/lacak/admin/detail_lacak_banyak.php?id={param_val}"
 
 
 def build_payload(kc_code: str, start_date: datetime.date, end_date: datetime.date, max_size: int = 5000) -> dict:
@@ -167,14 +178,7 @@ def extract_petugas(src: dict) -> str:
 
 @st.cache_data(ttl=120)
 def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFrame:
-    """
-    Mengambil data:
-    1. Target Date (Hari Ini): Diambil SEMUA (Dalam Kendali + Di Luar Kendali).
-    2. 6 Hari Sebelum Target Date: HANYA diambil yang Dalam Kendali (692xx).
-    3. ATURAN IRREGULARITY RETUR BARANG:
-       Jika ada irregularity Retur Barang, HANYA dimasukkan jika masih di nopen 692xx (Dalam Kendali).
-       Jika sudah di luar 692xx, tidak dimasukkan.
-    """
+    """Mengambil dan memfilter data kiriman jatuh tempo."""
     start_date = target_date - datetime.timedelta(days=6)
     payload = build_payload(kc_code, start_date, target_date)
 
@@ -209,27 +213,23 @@ def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFr
         loc_name = curr_loc.get("name") or "-"
         loc_code = str(curr_loc.get("code") or curr_loc.get("location_id") or "")
 
-        # Klasifikasi Kendali (Awalan 692)
         is_dalam_kendali = loc_code.startswith("692") or ("692" in loc_name)
         status_kendali = "Dalam Kendali" if is_dalam_kendali else "Di Luar Kendali"
 
         raw_swp = custom.get("final_swp_date_new")
         jt_date = extract_jatuh_tempo_date_wib(raw_swp)
 
-        # 1. Aturan 6 Hari Lalu: hanya yang Dalam Kendali
+        # 1. Paket 6 hari lalu hanya diambil jika dalam kendali
         if jt_date and jt_date < target_date:
             if not is_dalam_kendali:
                 continue
 
-        # 2. Aturan Irregularity Retur Barang:
-        # Cek apakah kiriman berstatus retur barang pada irregularity
+        # 2. Aturan Retur Barang: hanya jika dalam kendali (692xx)
         irreg_reason = str(custom.get("irregularityReason") or custom.get("irregularity_reason") or "").lower()
         irreg_status = str(custom.get("irregularityStatus") or custom.get("irregularity_status") or "").lower()
         connote_state = str(connote.get("connote_state") or "").lower()
 
         is_retur_barang = ("retur" in irreg_reason) or ("retur" in irreg_status) or ("return" in connote_state)
-
-        # Jika sudah berstatus retur dan posisinya di LUAR kendali (bukan 692), lewati/skip
         if is_retur_barang and not is_dalam_kendali:
             continue
 
@@ -244,6 +244,7 @@ def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFr
         else:
             status_sla = "Jatuh Tempo"
 
+        connote_code = str(connote.get("connote_code") or src.get("connote_code") or h.get("_id")).strip()
         petugas_name = extract_petugas(src)
         raw_updated = connote.get("updated_at") or src.get("updated_at")
         tgl_update = format_tgl_update(raw_updated)
@@ -252,7 +253,8 @@ def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFr
         kategori_hari = "Hari Ini" if jt_date == target_date else "6 Hari Lalu"
 
         rows.append({
-            "connote": connote.get("connote_code") or src.get("connote_code") or h.get("_id"),
+            "connote": connote_code,
+            "url_lacak": generate_pid_url(connote_code),
             "KC/KCP": loc_name,
             "Tgl Jatuh Tempo": tgl_jt_label,
             "Periode": kategori_hari,
@@ -298,6 +300,7 @@ def render_screenshot_card(courier_name: str, group_df: pd.DataFrame, header_bg:
     rows_list = []
     for _, row in group_df.iterrows():
         r_connote = str(row['connote'])
+        r_url = str(row['url_lacak'])
         r_loc = str(row['KC/KCP'])
         r_tgl = str(row['Tgl Update'])
         r_petugas = str(row['Petugas Update'])
@@ -308,10 +311,11 @@ def render_screenshot_card(courier_name: str, group_df: pd.DataFrame, header_bg:
         r_alamat = str(row['Alamat'])
 
         sla_color = "#b30000" if r_sla == "Over SLA" else "#d97706"
+        connote_display = f'<a href="{r_url}" target="_blank" style="color: #002060; text-decoration: underline; font-weight: bold;">{r_connote}</a>' if r_url else r_connote
 
         row_html = (
             f'<tr style="border-bottom: 1px solid #ddd; background-color: #ffffff; color: #111111; font-size: 13px;">'
-            f'<td style="padding: 7px 10px; font-weight: bold; border-right: 1px solid #eee;">{r_connote}</td>'
+            f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{connote_display}</td>'
             f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{r_loc}</td>'
             f'<td style="padding: 7px 10px; text-align: center; border-right: 1px solid #eee;">{r_tgl}</td>'
             f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{r_petugas}</td>'
@@ -362,7 +366,6 @@ kc_input = st.sidebar.text_input("KC Tujuan", value="69200")
 
 tgl_h6 = tgl_hari_ini - datetime.timedelta(days=6)
 
-# KARTU ATURAN RAPI DI SIDEBAR
 st.sidebar.markdown(
     f"""
     <div style="background-color: #f8fafc; border-left: 3px solid #0284c7; border-radius: 6px; padding: 10px; font-size: 12px; margin-top: 10px; color: #334155;">
@@ -428,9 +431,7 @@ total_jatuhtempo = len(df_filtered[df_filtered["Status SLA"] == "Jatuh Tempo"])
 total_dalam = len(df_filtered[df_filtered["Kendali"] == "Dalam Kendali"])
 total_luar = len(df_filtered[df_filtered["Kendali"] == "Di Luar Kendali"])
 
-# ========================================================
-# 5 KARTU METRIK MODERN DENGAN FONT ANGKA BESAR BOLD
-# ========================================================
+# --- 5 KARTU METRIK KPI ---
 c1, c2, c3, c4, c5 = st.columns(5)
 
 with c1:
@@ -490,7 +491,7 @@ with c5:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# --- GRAFIK DALAM KENDALI VS DI LUAR KENDALI (NAVY BLUE) ---
+# --- GRAFIK (NAVY BLUE) ---
 g1, g2 = st.columns(2)
 with g1:
     st.subheader("📊 Distribusi Posisi Kiriman")
@@ -543,52 +544,8 @@ else:
 st.markdown("---")
 
 # ========================================================
-# TABEL RINCIAN LENGKAP UTAMA
+# TABEL RINCIAN LENGKAP UTAMA (DENGAN KLIK CONNOTE PID)
 # ========================================================
 st.subheader("📋 Daftar Rincian Kiriman (Keseluruhan)")
 
-search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="Ketik kata kunci...")
-if search_kw:
-    kw = search_kw.lower()
-    cols_search = ["connote", "Penerima", "Alamat", "KC/KCP", "Petugas Update", "Status SLA"]
-    df_filtered = df_filtered[
-        df_filtered[cols_search].astype(str).apply(lambda row: row.str.lower().str.contains(kw)).any(axis=1)
-    ]
-
-df_filtered = df_filtered.reset_index(drop=True)
-df_filtered.insert(0, "nomor", df_filtered.index + 1)
-
-cols_to_render = [
-    "nomor",
-    "connote",
-    "KC/KCP",
-    "Petugas Update",
-    "Status SLA",
-    "Tgl Jatuh Tempo",
-    "Tgl Update",
-    "Status",
-    "Layanan",
-    "Penerima",
-    "Alamat",
-    "First Attempt",
-    "Alasan Gagal Antar",
-    "Irregularity",
-    "Kendali"
-]
-
-cols_valid = [c for c in cols_to_render if c in df_filtered.columns]
-
-st.dataframe(
-    df_filtered[cols_valid],
-    use_container_width=True,
-    height=400,
-    hide_index=True
-)
-
-csv_bytes = df_filtered[cols_valid].to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="📥 Unduh Data (CSV)",
-    data=csv_bytes,
-    file_name=f"jatuh_tempo_{kc_input}_{tgl_hari_ini}.csv",
-    mime="text/csv"
-)
+search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="K
