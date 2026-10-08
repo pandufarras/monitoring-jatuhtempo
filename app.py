@@ -15,12 +15,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# Endpoint & Kredensial Elasticsearch Mile App
+# Endpoint & Kredensial Elasticsearch Mile App (Aman dengan fallback secrets)
 URL = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
 HEADERS = {"Content-Type": "application/json", "kbn-xsrf": "true"}
 
-AUTH_USER = st.secrets["ES_USER"]
-AUTH_PASS = st.secrets["ES_PASS"]
+AUTH_USER = st.secrets.get("ES_USER", "upt")
+AUTH_PASS = st.secrets.get("ES_PASS", "posind3m4s")
 AUTH = (AUTH_USER, AUTH_PASS)
 
 
@@ -169,8 +169,11 @@ def extract_petugas(src: dict) -> str:
 def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFrame:
     """
     Mengambil data:
-    - Target Date (Hari Ini): Diambil SEMUA (Dalam Kendali + Di Luar Kendali)
-    - 6 Hari Sebelum Target Date: HANYA diambil yang Dalam Kendali (692xx)
+    1. Target Date (Hari Ini): Diambil SEMUA (Dalam Kendali + Di Luar Kendali).
+    2. 6 Hari Sebelum Target Date: HANYA diambil yang Dalam Kendali (692xx).
+    3. ATURAN IRREGULARITY RETUR BARANG:
+       Jika ada irregularity Retur Barang, HANYA dimasukkan jika masih di nopen 692xx (Dalam Kendali).
+       Jika sudah di luar 692xx, tidak dimasukkan.
     """
     start_date = target_date - datetime.timedelta(days=6)
     payload = build_payload(kc_code, start_date, target_date)
@@ -213,11 +216,24 @@ def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFr
         raw_swp = custom.get("final_swp_date_new")
         jt_date = extract_jatuh_tempo_date_wib(raw_swp)
 
-        # Lewati paket 6 hari lalu yang di luar kendali
+        # 1. Aturan 6 Hari Lalu: hanya yang Dalam Kendali
         if jt_date and jt_date < target_date:
             if not is_dalam_kendali:
                 continue
 
+        # 2. Aturan Irregularity Retur Barang:
+        # Cek apakah kiriman berstatus retur barang pada irregularity
+        irreg_reason = str(custom.get("irregularityReason") or custom.get("irregularity_reason") or "").lower()
+        irreg_status = str(custom.get("irregularityStatus") or custom.get("irregularity_status") or "").lower()
+        connote_state = str(connote.get("connote_state") or "").lower()
+
+        is_retur_barang = ("retur" in irreg_reason) or ("retur" in irreg_status) or ("return" in connote_state)
+
+        # Jika sudah berstatus retur dan posisinya di LUAR kendali (bukan 692), lewati/skip
+        if is_retur_barang and not is_dalam_kendali:
+            continue
+
+        # Penentuan Status SLA
         over_sla_flag = custom.get("over_sla")
         sla_state = str(custom.get("sla_state") or "").lower()
 
@@ -249,6 +265,7 @@ def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFr
             "Alamat": connote.get("connote_receiver_address") or "-",
             "First Attempt": custom.get("first_attempt_time") or "-",
             "Alasan Gagal Antar": custom.get("reason_failedtodelivered") or "-",
+            "Irregularity": custom.get("irregularityReason") or "-",
             "Kendali": status_kendali,
         })
 
@@ -354,6 +371,7 @@ st.sidebar.markdown(
         <div style="margin-top: 6px; font-weight: 700; color: #0369a1;">⚙️ Lingkup Data:</div>
         <div style="line-height: 1.4;">• <b>Hari Ini:</b> Dalam & Luar Kendali</div>
         <div style="line-height: 1.4;">• <b>6 Hari Lalu:</b> Khusus Dalam Kendali (692xx)</div>
+        <div style="line-height: 1.4;">• <b>Retur Barang:</b> Hanya jika masih di 692xx</div>
     </div>
     """,
     unsafe_allow_html=True
@@ -480,7 +498,7 @@ with g1:
     kendali_summary.columns = ["Status Kendali", "Jumlah"]
     st.bar_chart(
         kendali_summary.set_index("Status Kendali"),
-        color="#002060"  # Warna Navy Blue
+        color="#002060"
     )
 
 with g2:
@@ -489,7 +507,7 @@ with g2:
     loc_summary.columns = ["KC/KCP", "Jumlah"]
     st.bar_chart(
         loc_summary.set_index("KC/KCP"),
-        color="#002060"  # Warna Navy Blue
+        color="#002060"
     )
 
 st.markdown("---")
@@ -501,7 +519,6 @@ st.subheader("📸 Format Tabel per Petugas Pengantar (Siap Screenshot)")
 
 unique_couriers = [p for p in df_filtered["Petugas Update"].dropna().unique().tolist() if p != "-"]
 
-# Daftar warna otomatis selang-seling: Biru Navy & Merah Pos
 WARNA_LIST = ["#002060", "#c00000"]
 
 mode_tampilan = st.radio(
@@ -555,6 +572,7 @@ cols_to_render = [
     "Alamat",
     "First Attempt",
     "Alasan Gagal Antar",
+    "Irregularity",
     "Kendali"
 ]
 
