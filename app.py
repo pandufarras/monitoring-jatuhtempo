@@ -29,8 +29,44 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+def check_login():
+    """Memeriksa apakah pengguna sudah berhasil login."""
+    if st.session_state.get("authenticated", False):
+        return True
 
+    # Ambil kredensial dari secrets atau fallback default jika belum disetel
+    cfg_auth = st.secrets.get("credentials", {})
+    valid_user = cfg_auth.get("username", "admin")
+    valid_pass = cfg_auth.get("password", "posind69200")
+
+    # Tampilan form login sederhana dan rapi di tengah
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.subheader("🔒 Login KC Sampang")
+        
+        with st.form("form_login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Masuk", use_container_width=True)
+
+            if submit:
+                if username == valid_user and password == valid_pass:
+                    st.session_state["authenticated"] = True
+                    st.success("Login berhasil!")
+                    st.rerun()
+                else:
+                    st.error("Username atau password salah.")
+
+    return False
+
+# Panggil pencegat login sebelum menu atau data dimuat
+if not check_login():
+    st.stop()  # Hentikan eksekusi kode dashboard di bawahnya jika belum login
 # Endpoint & Kredensial Elasticsearch Mile App
+if st.sidebar.button("🚪 Keluar (Logout)"):
+    st.session_state["authenticated"] = False
+    st.rerun()
 URL_ES = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
 HEADERS_ES = {"Content-Type": "application/json", "kbn-xsrf": "true"}
 
