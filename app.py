@@ -253,21 +253,26 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
 def analyze_document_with_gemini(img_url: str) -> tuple:
+    """
+    Analisis visual presisi menggunakan Gemini REST API langsung via requests.
+    Bebas kendala ModuleNotFoundError / ImportError SDK.
+    """
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         return (False, "API Key Gemini belum disetel di secrets.toml")
 
     try:
-        resp = requests.get(img_url, timeout=12, verify=False)
-        if resp.status_code != 200:
+        # 1. Unduh dan konversi gambar ke JPEG Base64
+        resp_img = requests.get(img_url, timeout=12, verify=False)
+        if resp_img.status_code != 200:
             return (False, "Gagal mengunduh gambar")
 
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        img = Image.open(io.BytesIO(resp_img.content)).convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
-        clean_jpg_bytes = buf.getvalue()
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
-        prompt = (
+        prompt_text = (
             "Periksa apakah gambar ini adalah dokumen identitas resmi penduduk "
             "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
             "Jika gambar merupakan wajah orang/selfie saja tanpa identitas, foto rumah, teras, pagar, "
@@ -278,38 +283,39 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
         )
 
-        teks_hasil = ""
+        # 2. Endpoint REST API resmi Google AI
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
+                    {"text": prompt_text}
+                ]
+            }],
+            "generationConfig": {
+                "response_mime_type": "application/json"
+            }
+        }
 
-        # Deteksi otomatis pustaka google-genai atau google.generativeai
-        try:
-            from google import genai
-            from google.genai import types
+        # 3. Request ke API Gemini
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=20)
+        
+        # Fallback ke gemini-1.5-flash jika model 2.5 belum aktif pada key Anda
+        if resp.status_code == 404:
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+            resp = requests.post(api_url, headers=headers, json=payload, timeout=20)
 
-            client = genai.Client(api_key=api_key)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Part.from_bytes(data=clean_jpg_bytes, mime_type="image/jpeg"),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
-            )
-            teks_hasil = response.text
-        except (ImportError, AttributeError):
-            import google.generativeai as genai_old
+        if resp.status_code != 200:
+            return (False, f"HTTP Error {resp.status_code}: {resp.text[:30]}")
 
-            genai_old.configure(api_key=api_key)
-            model = genai_old.GenerativeModel("gemini-1.5-flash")
-            response = model.generate_content([
-                {"mime_type": "image/jpeg", "data": clean_jpg_bytes},
-                prompt
-            ])
-            teks_hasil = response.text
-
-        teks_clean = re.sub(r"^```json\s*|\s*```$", "", teks_hasil.strip())
+        res_json = resp.json()
+        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+        
+        # Bersihkan format JSON
+        teks_clean = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
         data = json.loads(teks_clean)
+        
         is_v = bool(data.get("valid", False))
         alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
         return (is_v, alasan)
@@ -319,8 +325,6 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         if "API_KEY_INVALID" in err_msg:
             return (False, "API Key salah/tidak aktif")
         return (False, f"Gagal AI: {err_msg[:30]}")
-
-
 # ========================================================
 # FUNGSI BANTUAN OPERASIONAL
 # ========================================================
