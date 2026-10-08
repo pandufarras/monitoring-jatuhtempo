@@ -1,7 +1,7 @@
 import base64
 import datetime
+import hmac
 import io
-import json
 import re
 import urllib.parse
 from difflib import SequenceMatcher
@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 import urllib3
 
-# OCR bersifat OPSIONAL: jika tidak terpasang, algoritma lama tetap jalan
+# OCR bersifat OPSIONAL: jika tidak terpasang, heuristik warna tetap berjalan
 try:
     import pytesseract
     OCR_TERSEDIA = True
@@ -40,11 +40,7 @@ AUTH_ES = (AUTH_USER, AUTH_PASS)
 
 
 # ========================================================
-# MANAJEMEN AUTENTIKASI & SESSION COOKIE LINTAS TAB
-import hmac
-
-# ========================================================
-# MANAJEMEN AUTENTIKASI LINTAS TAB (BAWAAN STREAMLIT QUERY PARAMS)
+# MANAJEMEN AUTENTIKASI LINTAS TAB (STREAMLIT QUERY PARAMS)
 # ========================================================
 def check_login() -> bool:
     cfg_auth = st.secrets.get("credentials", {})
@@ -55,24 +51,20 @@ def check_login() -> bool:
         st.error("Kredensial login belum disetel di Secrets Streamlit.")
         st.stop()
 
-    # Buat token sesi sederhana berdasarkan hash kredensial rahasia
     expected_token = hmac.new(
         key=valid_pass.encode(),
         msg=valid_user.encode(),
         digestmod="sha256"
     ).hexdigest()[:16]
 
-    # 1. Cek sesi aktif di session_state
     if st.session_state.get("authenticated", False):
         return True
 
-    # 2. Cek token di URL parameter (agar saat buka tab baru tetap otomatis login)
     current_token = st.query_params.get("session_auth", "")
     if current_token == expected_token:
         st.session_state["authenticated"] = True
         return True
 
-    # 3. Form Login jika belum ada sesi
     _, col_form, _ = st.columns([1, 1.5, 1])
     with col_form:
         st.markdown("<br><br>", unsafe_allow_html=True)
@@ -86,7 +78,6 @@ def check_login() -> bool:
             if submit:
                 if username_input == valid_user and password_input == valid_pass:
                     st.session_state["authenticated"] = True
-                    # Tempel token ke query URL agar terbawa ke tab baru
                     st.query_params["session_auth"] = expected_token
                     st.success("Login berhasil!")
                     st.rerun()
@@ -95,11 +86,12 @@ def check_login() -> bool:
 
     return False
 
-# Jalankan pencegat login sebelum dashboard dimuat
 if not check_login():
     st.stop()
+
+
 # ========================================================
-# 1A. LAPISAN OCR: BACA TEKS PADA GAMBAR (tahan blur, tint, rotasi)
+# 1A. LAPISAN OCR: BACA TEKS PADA GAMBAR
 # ========================================================
 KW_KUAT = [
     "NIK", "PROVINSI", "KEWARGANEGARAAN", "GOL DARAH", "STATUS PERKAWINAN",
@@ -164,7 +156,7 @@ def ocr_identity_check(img: Image.Image) -> tuple:
 
 
 # ========================================================
-# 1B. ALGORITMA HEURISTIK CITRA DOKUMEN IDENTITAS (TAHAP 1)
+# 1B. ALGORITMA HEURISTIK CITRA DOKUMEN IDENTITAS
 # ========================================================
 def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
     try:
@@ -249,109 +241,6 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
     return evaluate_two_photos(f1_url, f2_url)
 
 
-# ========================================================
-# 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
-# ========================================================
-# 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
-# ========================================================
-@st.cache_data(ttl=1800)
-def get_valid_gemini_endpoint(api_key: str) -> str:
-    """Mengambil model aktif langsung dari akun Google AI Studio."""
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            daftar = res.json().get("models", [])
-            # Cari model yang mendukung generateContent
-            nama_tersedia = [
-                m.get("name") for m in daftar 
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-            # Prioritaskan varian flash
-            for prioritas in [
-                "models/gemini-2.0-flash",
-                "models/gemini-2.0-flash-exp",
-                "models/gemini-1.5-flash",
-                "models/gemini-1.5-flash-latest",
-                "models/gemini-1.5-flash-8b",
-                "models/gemini-1.5-pro"
-            ]:
-                if prioritas in nama_tersedia:
-                    return f"https://generativelanguage.googleapis.com/v1beta/{prioritas}:generateContent?key={api_key}"
-            
-            # Jika tidak ada yang cocok di atas, ambil model pertama yang mendukung generateContent
-            if nama_tersedia:
-                return f"https://generativelanguage.googleapis.com/v1beta/{nama_tersedia[0]}:generateContent?key={api_key}"
-    except Exception:
-        pass
-    # Fallback default
-    return f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-
-
-def analyze_document_with_gemini(img_url: str) -> tuple:
-    api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
-    if not api_key:
-        return (False, "API Key kosong di Secrets")
-
-    try:
-        # 1. Unduh gambar
-        resp_img = requests.get(img_url, timeout=12, verify=False)
-        if resp_img.status_code != 200:
-            return (False, f"Gagal unduh gambar: HTTP {resp_img.status_code}")
-
-        img = Image.open(io.BytesIO(resp_img.content)).convert("RGB")
-        img.thumbnail((700, 700), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=80)
-        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-        prompt_text = (
-            "Periksa apakah gambar ini adalah dokumen identitas resmi penduduk "
-            "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
-            "Jika berupa foto orang/wajah saja, foto rumah, teras, pagar, plang kantor, jalan, amplop tanpa KTP, atau screenshot chat, "
-            "maka BUKAN dokumen identitas.\n"
-            "Wajib jawab HANYA format JSON persis: "
-            "{\"valid\": true, \"alasan\": \"KTP/KK sah\"} atau "
-            "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
-        )
-
-        headers = {"Content-Type": "application/json"}
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
-                    {"text": prompt_text}
-                ]
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json"
-            }
-        }
-
-        # 2. Panggil API Google
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
-
-        # 3. Tampilkan pesan mentah jika gagal
-        if resp.status_code != 200:
-            try:
-                data_err = resp.json()
-                pesan_asli = data_err.get("error", {}).get("message", resp.text)
-                return (False, f"HTTP {resp.status_code}: {pesan_asli[:60]}")
-            except Exception:
-                return (False, f"HTTP {resp.status_code}: {resp.text[:60]}")
-
-        # 4. Parsing hasil jika berhasil
-        raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        clean_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
-        data = json.loads(clean_text)
-
-        is_v = bool(data.get("valid", False))
-        alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
-        return (is_v, alasan)
-
-    except Exception as e:
-        return (False, f"Exception: {str(e)[:40]}")
 # ========================================================
 # FUNGSI BANTUAN OPERASIONAL
 # ========================================================
@@ -785,6 +674,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             c_txt, m_url = extract_coordinate_gmaps(src)
             f_orang, f_ktp = extract_all_photos(src)
 
+            # Evaluasi gambar murni heuristik citra + OCR
             stat_inv, ket_inv = evaluate_connote_photos_cached(c_code, f_orang, f_ktp)
 
             state = connote.get("connote_state") or "-"
@@ -919,7 +809,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
 
             is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
 
-            # Baris tabel merah muda bila INVALID
             if is_valid:
                 row_bg = "#ffffff"
                 border_b = "1px solid #cbd5e1"
@@ -937,7 +826,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
                 f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
                 f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
-                # Kolom hanya menampilkan alamat tanpa nama penerima
                 f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><span style='color: #1e293b; font-size: 12px; font-weight: 500;'>{row['alamat penerima']}</span></td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
@@ -985,77 +873,39 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             warna_hdr = WARNA_LIST[idx_p % 2]
             render_tabel_kartu_ma(p_label, df_sub, header_bg=warna_hdr)
 
-            c_ai, c_edit = st.columns([1, 2])
+            # KOREKSI STATUS MANUAL PER RESI
+            with st.expander(f"✍️ Koreksi Manual ({p_label})", expanded=False):
+                list_resi_p = df_sub["connote"].tolist()
+                resi_pilih = st.selectbox("Pilih Resi:", options=list_resi_p, key=f"sel_r_{idx_p}")
 
-            # 1. TOMBOL PERIKSA AI GEMINI
-            with c_ai:
-                if st.button(f"✨ Jalankan AI Gemini", key=f"btn_ai_{idx_p}"):
-                    total_resi = len(df_sub)
-                    prog_bar = st.progress(0)
-                    txt_status = st.empty()
+                data_resi_aktif = df_sub[df_sub["connote"] == resi_pilih].iloc[0]
 
-                    for c_idx, (_, r_data) in enumerate(df_sub.iterrows(), start=1):
-                        resi_curr = r_data["connote"]
-                        txt_status.caption(f"Memeriksa {resi_curr} ({c_idx}/{total_resi})...")
-                        f_target = r_data.get("foto_ktp")
+                with st.form(key=f"form_koreksi_{idx_p}_{resi_pilih}"):
+                    ce1, ce2 = st.columns([1, 2])
+                    with ce1:
+                        st_edit = st.selectbox(
+                            "Status:",
+                            ["VALID", "INVALID"],
+                            index=0 if data_resi_aktif["Hasil Investigasi"] == "VALID" else 1
+                        )
+                    with ce2:
+                        ket_edit = st.text_input(
+                            "Keterangan Pengawas:",
+                            value=data_resi_aktif["Penjelasan Invalid"]
+                        )
 
-                        if not f_target:
-                            st_ai, al_ai = "INVALID", "Foto identitas nihil"
-                        else:
-                            is_v, alasan = analyze_document_with_gemini(f_target)
-                            st_ai = "VALID" if is_v else "INVALID"
-                            al_ai = alasan
+                    btn_simpan = st.form_submit_button("💾 Simpan Perubahan")
 
-                        st.session_state["manual_overrides"][resi_curr] = {
-                            "status": st_ai,
-                            "ket": al_ai
+                    if btn_simpan:
+                        st.session_state["manual_overrides"][resi_pilih] = {
+                            "status": st_edit,
+                            "ket": ket_edit
                         }
                         st.session_state["audit_data"].loc[
-                            st.session_state["audit_data"]["connote"] == resi_curr,
+                            st.session_state["audit_data"]["connote"] == resi_pilih,
                             ["Hasil Investigasi", "Penjelasan Invalid"]
-                        ] = [st_ai, al_ai]
-
-                        prog_bar.progress(c_idx / total_resi)
-
-                    txt_status.empty()
-                    prog_bar.empty()
-                    st.success(f"Analisis Gemini untuk {p_label} selesai!")
-                    st.rerun()
-
-            # 2. KOREKSI STATUS MANUAL
-            with c_edit:
-                with st.expander(f"✍️ Koreksi Manual ({p_label})", expanded=False):
-                    list_resi_p = df_sub["connote"].tolist()
-                    resi_pilih = st.selectbox("Pilih Resi:", options=list_resi_p, key=f"sel_r_{idx_p}")
-
-                    data_resi_aktif = df_sub[df_sub["connote"] == resi_pilih].iloc[0]
-
-                    with st.form(key=f"form_koreksi_{idx_p}_{resi_pilih}"):
-                        ce1, ce2 = st.columns([1, 2])
-                        with ce1:
-                            st_edit = st.selectbox(
-                                "Status:",
-                                ["VALID", "INVALID"],
-                                index=0 if data_resi_aktif["Hasil Investigasi"] == "VALID" else 1
-                            )
-                        with ce2:
-                            ket_edit = st.text_input(
-                                "Keterangan Pengawas:",
-                                value=data_resi_aktif["Penjelasan Invalid"]
-                            )
-
-                        btn_simpan = st.form_submit_button("💾 Simpan Perubahan")
-
-                        if btn_simpan:
-                            st.session_state["manual_overrides"][resi_pilih] = {
-                                "status": st_edit,
-                                "ket": ket_edit
-                            }
-                            st.session_state["audit_data"].loc[
-                                st.session_state["audit_data"]["connote"] == resi_pilih,
-                                ["Hasil Investigasi", "Penjelasan Invalid"]
-                            ] = [st_edit, ket_edit]
-                            st.success(f"Resi {resi_pilih} berhasil diperbarui!")
-                            st.rerun()
+                        ] = [st_edit, ket_edit]
+                        st.success(f"Resi {resi_pilih} berhasil diperbarui!")
+                        st.rerun()
 
             st.markdown("<div style='margin-bottom: 25px;'></div>", unsafe_allow_html=True)
