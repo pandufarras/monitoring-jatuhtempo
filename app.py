@@ -845,7 +845,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     st.markdown("---")
     st.subheader("📸 Format Tabel Uji Petik per Petugas Pengantar (Siap Screenshot)")
 
-   def render_tabel_kartu_ma(header_label: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
+  def render_tabel_kartu_ma(header_label: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
         table_rows = []
         for idx, (_, row) in enumerate(group_df.iterrows(), start=1):
             r_link = f"<a href='{row['url_lacak']}' target='_blank' style='color:#002060; font-weight:bold; text-decoration:underline;'>{row['connote']}</a>" if row['url_lacak'] else row['connote']
@@ -855,7 +855,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
 
             is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
             
-            # ATUR WARNA BACKGROUND: Merah muda lembut (#fef2f2) jika INVALID, putih (#ffffff) jika VALID
+            # Warna background merah muda lembut (#fef2f2) jika INVALID, putih (#ffffff) jika VALID
             bg_row_color = "#ffffff" if is_valid else "#fef2f2"
             border_row_color = "#cbd5e1" if is_valid else "#fecaca"
 
