@@ -6,7 +6,6 @@ import re
 import urllib.parse
 from difflib import SequenceMatcher
 
-import extra_streamlit_components as stx
 from PIL import Image, ImageOps
 import pandas as pd
 import requests
@@ -42,32 +41,38 @@ AUTH_ES = (AUTH_USER, AUTH_PASS)
 
 # ========================================================
 # MANAJEMEN AUTENTIKASI & SESSION COOKIE LINTAS TAB
+import hmac
+
 # ========================================================
-def get_cookie_manager():
-    return stx.CookieManager(key="auth_cookies")
-
-cookie_manager = get_cookie_manager()
-
+# MANAJEMEN AUTENTIKASI LINTAS TAB (BAWAAN STREAMLIT QUERY PARAMS)
+# ========================================================
 def check_login() -> bool:
-    # 1. Cek sesi aktif di session_state saat ini
-    if st.session_state.get("authenticated", False):
-        return True
-
-    # 2. Cek token di cookie browser agar tab baru otomatis login
-    auth_token = cookie_manager.get("kc_sampang_auth")
-    if auth_token == "logged_in":
-        st.session_state["authenticated"] = True
-        return True
-
-    # 3. Ambil kredensial dari st.secrets (tidak ada hardcode username/password)
     cfg_auth = st.secrets.get("credentials", {})
     valid_user = cfg_auth.get("username")
     valid_pass = cfg_auth.get("password")
 
     if not valid_user or not valid_pass:
-        st.error("Kredensial login belum disetel pada Secrets dashboard Streamlit.")
+        st.error("Kredensial login belum disetel di Secrets Streamlit.")
         st.stop()
 
+    # Buat token sesi sederhana berdasarkan hash kredensial rahasia
+    expected_token = hmac.new(
+        key=valid_pass.encode(),
+        msg=valid_user.encode(),
+        digestmod="sha256"
+    ).hexdigest()[:16]
+
+    # 1. Cek sesi aktif di session_state
+    if st.session_state.get("authenticated", False):
+        return True
+
+    # 2. Cek token di URL parameter (agar saat buka tab baru tetap otomatis login)
+    current_token = st.query_params.get("session_auth", "")
+    if current_token == expected_token:
+        st.session_state["authenticated"] = True
+        return True
+
+    # 3. Form Login jika belum ada sesi
     _, col_form, _ = st.columns([1, 1.5, 1])
     with col_form:
         st.markdown("<br><br>", unsafe_allow_html=True)
@@ -81,9 +86,8 @@ def check_login() -> bool:
             if submit:
                 if username_input == valid_user and password_input == valid_pass:
                     st.session_state["authenticated"] = True
-                    # Cookie aktif selama 7 hari
-                    expires = datetime.datetime.now() + datetime.timedelta(days=7)
-                    cookie_manager.set("kc_sampang_auth", "logged_in", expires_at=expires)
+                    # Tempel token ke query URL agar terbawa ke tab baru
+                    st.query_params["session_auth"] = expected_token
                     st.success("Login berhasil!")
                     st.rerun()
                 else:
@@ -91,11 +95,9 @@ def check_login() -> bool:
 
     return False
 
-# Jalankan gatekeeper: Hentikan eksekusi dashboard jika belum terautentikasi
+# Jalankan pencegat login sebelum dashboard dimuat
 if not check_login():
     st.stop()
-
-
 # ========================================================
 # 1A. LAPISAN OCR: BACA TEKS PADA GAMBAR (tahan blur, tint, rotasi)
 # ========================================================
@@ -481,7 +483,8 @@ st.sidebar.title("🎛️ Navigasi Menu")
 
 if st.sidebar.button("🚪 Keluar (Logout)"):
     st.session_state["authenticated"] = False
-    cookie_manager.delete("kc_sampang_auth")
+    if "session_auth" in st.query_params:
+        del st.query_params["session_auth"]
     st.rerun()
 
 st.sidebar.markdown("---")
