@@ -12,8 +12,6 @@ import requests
 import streamlit as st
 import urllib3
 
-import io
-
 # OCR bersifat OPSIONAL: jika tidak terpasang, algoritma lama tetap jalan
 try:
     import pytesseract
@@ -44,13 +42,11 @@ AUTH_ES = (AUTH_USER, AUTH_PASS)
 # ========================================================
 # 1A. LAPISAN OCR: BACA TEKS PADA GAMBAR (tahan blur, tint, rotasi)
 # ========================================================
-# Kata kunci KUAT = hampir pasti hanya ada di KTP/KK/SIM
 KW_KUAT = [
     "NIK", "PROVINSI", "KEWARGANEGARAAN", "GOL DARAH", "STATUS PERKAWINAN",
     "BERLAKU HINGGA", "JENIS KELAMIN", "TEMPAT TGL LAHIR", "KARTU KELUARGA",
     "KEPALA KELUARGA", "NO KK", "NAMA LENGKAP", "SURAT IZIN MENGEMUDI",
 ]
-# Kata kunci PENDUKUNG = bisa muncul juga di alamat amplop, tidak cukup sendirian
 KW_PENDUKUNG = [
     "KABUPATEN", "JAWA TIMUR", "AGAMA", "PEKERJAAN", "KEL DESA", "KECAMATAN",
     "ISLAM", "WNI", "KAWIN", "WIRASWASTA", "LAKI LAKI", "PEREMPUAN",
@@ -98,7 +94,7 @@ def ocr_identity_check(img: Image.Image) -> tuple:
         scale = 1100 / max(w, 1)
         if scale != 1:
             gray = gray.resize((1100, max(1, int(h * scale))), Image.LANCZOS)
-        gray = ImageOps.autocontrast(gray, cutoff=2)  # netralkan tint & foto redup
+        gray = ImageOps.autocontrast(gray, cutoff=2)
 
         for angle in (0, 270, 90, 180):
             g = gray if angle == 0 else gray.rotate(angle, expand=True)
@@ -115,10 +111,6 @@ def ocr_identity_check(img: Image.Image) -> tuple:
 # 1B. ALGORITMA HEURISTIK CITRA DOKUMEN IDENTITAS (TAHAP 1)
 # ========================================================
 def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
-    """
-    Heuristik warna kertas + kepadatan teks (logika lama tetap),
-    ditambah OCR sebagai pencegat terakhir sebelum vonis 'bukan dokumen'.
-    """
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
         w_orig, h_orig = img.size
@@ -163,7 +155,7 @@ def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
         if aspect_ratio >= 1.50 and pct_wa >= 0.5 and pct_cyan < 2.0:
             return (False, "Foto terdeteksi screenshot chat WA")
 
-        # 2. VALIDASI DOKUMEN IDENTITAS (aturan lama)
+        # 2. VALIDASI DOKUMEN IDENTITAS
         if pct_paper >= 15.0 and pct_text >= 2.5:
             return (True, "")
         if pct_text >= 5.0:
@@ -171,13 +163,13 @@ def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
         if pct_cyan >= 1.0:
             return (True, "")
 
-        # 3. LAPISAN BARU A: OCR (KTP blur / tint / miring / di atas amplop / ada stempel GPS)
+        # 3. LAPISAN A: OCR
         if OCR_TERSEDIA:
             ok, _alasan = ocr_identity_check(img)
             if ok:
                 return (True, "")
 
-        # 4. LAPISAN BARU B: fallback warna lebih longgar, HANYA jika OCR tidak terpasang
+        # 4. LAPISAN B: Fallback warna jika OCR tidak ada
         if not OCR_TERSEDIA and pct_paper >= 20.0 and pct_text >= 1.5:
             return (True, "")
 
@@ -189,7 +181,6 @@ def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
 
 
 def evaluate_two_photos(f1_url: str, f2_url: str) -> tuple:
-    """Evaluasi Foto 2 (Tempat KTP/KK semestinya diupload)."""
     if not f1_url or not f2_url:
         return ("INVALID", "Foto identitas tidak ada (kurang foto)")
 
@@ -210,7 +201,6 @@ def evaluate_two_photos(f1_url: str, f2_url: str) -> tuple:
 
 @st.cache_data(show_spinner=False)
 def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) -> tuple:
-    """Mencegah unduhan foto berulang setiap interaksi UI."""
     return evaluate_two_photos(f1_url, f2_url)
 
 
@@ -218,10 +208,6 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
 def analyze_document_with_gemini(img_url: str) -> tuple:
-    """
-    Analisis visual presisi menggunakan Gemini.
-    Menjamin gambar di-encode ulang ke JPEG murni agar bebas error 400.
-    """
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         return (False, "API Key Gemini belum disetel di secrets.toml")
@@ -235,6 +221,10 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=85)
         clean_jpg_bytes = buf.getvalue()
+
+        # Inisialisasi klien Gemini (google-genai SDK)
+        from google import genai
+        from google.genai import types
 
         client = genai.Client(api_key=api_key)
         prompt = (
@@ -358,12 +348,8 @@ def extract_coordinate_gmaps(src: dict) -> tuple:
         return (coord_text, gmaps_link)
     return ("-", "")
 
+
 def extract_all_photos(src: dict) -> tuple:
-    """
-    Ekstraksi foto yang lebih cerdas: Mengumpulkan semua URL foto dari seluruh field 
-    (termasuk photo3, photo_ktp, dll), membuang ttd/signature, dan memastikan 
-    foto 1 (orang) dan foto 2 (KTP/KK) tidak duplikat jika ada foto lain yang tersedia.
-    """
     if not isinstance(src, dict):
         return ("", "")
     
@@ -386,45 +372,39 @@ def extract_all_photos(src: dict) -> tuple:
         elif isinstance(obj, list):
             for v in obj: cari_url(v)
 
-    # Ambil secara terstruktur dari field umum terlebih dahulu
     f_1 = pod.get("photo") or pod.get("photo1") or ""
     f_2 = pod.get("photo2") or pod.get("photo_ktp") or ""
     f_3 = pod.get("photo3") or pod.get("photo_identitas") or ""
 
-    # Kumpulkan semua kandidat URL dari seluruh root object
     cari_url(pod)
     cari_url(custom)
     cari_url(connote)
 
-    # Filter kandidat yang bersih dari signature
     kandidat_bersih = [u for u in kandidat if "signature" not in u.lower() and "ttd" not in u.lower()]
 
     foto_orang = ""
     foto_ktp = ""
 
-    # Tentukan Foto 1 (Prioritaskan foto pertama atau foto ke-3 jika ada)
     if f_1 and f_1 in kandidat_bersih:
         foto_orang = f_1
     elif len(kandidat_bersih) > 0:
         foto_orang = kandidat_bersih[0]
 
-    # Tentukan Foto 2 (Cari foto lain yang TIDAK SAMA dengan foto_orang)
     if f_3 and f_3 != foto_orang and f_3 in kandidat_bersih:
         foto_ktp = f_3
     elif f_2 and f_2 != foto_orang and f_2 in kandidat_bersih:
         foto_ktp = f_2
     else:
-        # Cari foto lain dalam list yang berbeda dari foto_orang
         for u in kandidat_bersih:
             if u != foto_orang:
                 foto_ktp = u
                 break
 
-    # Fallback terakhir jika benar-benar hanya ada 1 foto di sistem
     if not foto_ktp and foto_orang:
         foto_ktp = foto_orang
 
     return (foto_orang, foto_ktp)
+
 
 def render_metric_card(title: str, value: int, badge_text: str = "", badge_bg: str = "#e2e8f0", badge_color: str = "#334155", card_border: str = "#e2e8f0", icon_char: str = ""):
     badge_html = f'<div style="display: inline-block; background-color: {badge_bg}; color: {badge_color}; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; margin-top: 6px;">{badge_text}</div>' if badge_text else ''
@@ -627,13 +607,11 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     st.caption("Monitoring Kiriman Surat Tercatat MA (LNMAPAG05692A & LNMAPN05692A)")
 
     today = datetime.date.today()
-    # Default: 2 hari ke belakang (Misal hari ini tgl 8, maka default tgl 6 s.d. tgl 6)
     default_tgl = today - datetime.timedelta(days=2)
     
     d_start = st.sidebar.date_input("Dari Tanggal", default_tgl)
     d_end = st.sidebar.date_input("Sampai Tanggal", default_tgl)
 
-    # Filter Status Kiriman
     filter_status = st.sidebar.radio(
         "Filter Status Kiriman:",
         ["Semua Status", "⚠️ Hanya INVALID (Perlu Cek)", "✅ Hanya VALID"],
@@ -647,6 +625,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
         if "manual_overrides" in st.session_state:
             del st.session_state["manual_overrides"]
         st.rerun()
+
     def build_payload_ma(start_date: datetime.date, end_date: datetime.date) -> dict:
         gte_utc = f"{start_date.strftime('%Y-%m-%d')}T00:00:00.000Z"
         lte_utc = f"{end_date.strftime('%Y-%m-%d')}T23:59:59.999Z"
@@ -669,7 +648,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
                                 "minimum_should_match": 1,
                             }
                         },
-                        # Gunakan field root 'created_at' untuk tanggal pembuatan resi
                         {"range": {"created_at": {"format": "strict_date_optional_time", "gte": gte_utc, "lte": lte_utc}}},
                     ],
                     "must_not": [
@@ -681,7 +659,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             },
         }
 
-    # Cache 10 menit agar interaksi UI dan koreksi manual berjalan mulus
     @st.cache_data(ttl=600)
     def fetch_data_ma(start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
         payload = build_payload_ma(start_date, end_date)
@@ -695,7 +672,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             return pd.DataFrame()
         
         hits = resp.json().get("hits", {}).get("hits", [])
-        # ... sisa kode pemrosesan data ...
         rows = []
         for h in hits:
             src = h.get("_source", {})
@@ -717,7 +693,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             c_txt, m_url = extract_coordinate_gmaps(src)
             f_orang, f_ktp = extract_all_photos(src)
 
-            # Evaluasi gambar ter-cache per resi
             stat_inv, ket_inv = evaluate_connote_photos_cached(c_code, f_orang, f_ktp)
 
             state = connote.get("connote_state") or "-"
@@ -755,7 +730,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     if "audit_data" not in st.session_state:
         df_init = df_raw_ma.copy()
 
-        # Penggabungan (Mapping) Data Petugas Rudy ke Iqbal
         df_init["pengantar_label"] = df_init.apply(lambda r: f"{r['petugas update']} ( {r['kantor update']} )", axis=1)
         target_nama_gabung = "Moh Iqbal Syahputra ( KCP KETAPANG SAMPANG 69261 )"
         mask_rudy = df_init["pengantar_label"].str.contains("Rudy Ermawanto", case=False, na=False) & \
@@ -772,7 +746,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
 
     df_ma = st.session_state["audit_data"]
 
-    # --- KPI METRIK KESELURUHAN (TIDAK TERPENGARUH FILTER TAMPILAN) ---
+    # --- KPI METRIK KESELURUHAN ---
     total_ma = len(df_ma)
     total_valid = len(df_ma[df_ma["Hasil Investigasi"] == "VALID"])
     total_invalid = len(df_ma[df_ma["Hasil Investigasi"] == "INVALID"])
@@ -806,7 +780,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             "val_num": round(v_p / t_p * 100, 1),
         })
 
-    # Sort mutlak berdasarkan Invalid terbanyak
     df_summary = pd.DataFrame(summary_rows).sort_values(
         by=["Invalid", "Total Kiriman"],
         ascending=[False, False]
@@ -815,7 +788,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     summary_tr = []
     for _, r in df_summary.iterrows():
         b_color = "#16a34a" if r["val_num"] >= 90 else ("#d97706" if r["val_num"] >= 70 else "#dc2626")
-        # Beri warna background merah muda jika ada invalid
         bg_row = "#fef2f2" if r["val_num"] < 100.0 else "#ffffff"
 
         summary_tr.append(
@@ -862,7 +834,8 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
                 f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
                 f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
-                f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><b>{row['nama penerima']}</b><br><span style='color: #64748b; font-size: 11px;'>{row['alamat penerima']}</span></td>"
+                # DIUBAH: Hanya alamat penerima saja tanpa nama penerima
+                f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><span style='color: #1e293b; font-size: 12px; font-weight: 500;'>{row['alamat penerima']}</span></td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_ktp}</td>"
@@ -876,7 +849,8 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             f"<div style='background-color: #ffffff; color: #000000; text-align: center; padding: 10px 6px; font-size: 16px; font-weight: 900; letter-spacing: 0.5px; border-bottom: 2px solid #111;'>{header_label}</div>"
             f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
             f"<thead><tr style='background-color: {header_bg}; color: #ffffff; font-size: 13px; text-align: center;'>"
-            f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Penerima & Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
+            # DIUBAH: Header diganti menjadi 'Alamat'
+            f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
             f"</tr></thead>"
             f"<tbody>{''.join(table_rows)}</tbody>"
             f"</table>"
@@ -895,7 +869,6 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     if df_tampil.empty:
         st.info(f"Tidak ada data dengan status **{filter_status}**.")
     else:
-        # Kunci urutan pengantar mengikuti sorting Invalid terbanyak dari df_summary
         urutan_prioritas = df_summary["Petugas & Kantor"].tolist()
         pengantar_aktif = set(df_tampil["pengantar_label"].dropna().unique())
         pengantar_terfilter = [p for p in urutan_prioritas if p in pengantar_aktif]
@@ -912,7 +885,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
 
             c_ai, c_edit = st.columns([1, 2])
 
-            # 1. TOMBOL PERIKSA AI GEMINI PER PENGANTAR
+            # 1. TOMBOL PERIKSA AI GEMINI
             with c_ai:
                 if st.button(f"✨ Jalankan AI Gemini", key=f"btn_ai_{idx_p}"):
                     total_resi = len(df_sub)
@@ -947,7 +920,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
                     st.success(f"Analisis Gemini untuk {p_label} selesai!")
                     st.rerun()
 
-            # 2. KOREKSI STATUS MANUAL KHUSUS RESI PENGANTAR INI
+            # 2. KOREKSI STATUS MANUAL
             with c_edit:
                 with st.expander(f"✍️ Koreksi Manual ({p_label})", expanded=False):
                     list_resi_p = df_sub["connote"].tolist()
