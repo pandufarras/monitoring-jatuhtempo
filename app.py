@@ -278,7 +278,7 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         return (False, "API Key belum disetel di Secrets")
 
     try:
-        # 1. Unduh dan perkecil ukuran gambar
+        # 1. Unduh dan kompres gambar
         resp_img = requests.get(img_url, timeout=12, verify=False)
         if resp_img.status_code != 200:
             return (False, "Gagal mengunduh gambar")
@@ -292,18 +292,14 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         prompt_text = (
             "Periksa apakah gambar ini adalah dokumen identitas resmi penduduk "
             "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
-            "Jika berupa foto wajah/selfie saja, rumah, jalan, plang kantor, amplop tanpa KTP, atau screenshot chat, "
+            "Jika berupa foto orang/wajah saja, foto rumah, teras, pagar, plang kantor, jalan, amplop tanpa KTP, atau screenshot chat, "
             "maka BUKAN dokumen identitas.\n"
-            "Wajib jawab HANYA format JSON persis: "
+            "Wajib jawab HANYA berupa JSON persis: "
             "{\"valid\": true, \"alasan\": \"KTP/KK sah\"} atau "
             "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
         )
 
-        # 2. Ambil nama model valid secara otomatis
-        model_name = get_active_gemini_model(api_key)
-
-        # 3. Request ke API Gemini
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [{
                 "parts": [
@@ -316,10 +312,21 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             }
         }
 
-        resp = requests.post(api_url, headers={"Content-Type": "application/json"}, json=payload, timeout=25)
+        # 2. Coba endpoint stabil: gemini-2.0-flash (v1beta) lalu fallback ke gemini-1.5-flash (v1)
+        endpoints = [
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
+            f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={api_key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={api_key}"
+        ]
 
-        if resp.status_code != 200:
-            err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
+        resp = None
+        for url in endpoints:
+            resp = requests.post(url, headers=headers, json=payload, timeout=25)
+            if resp.status_code == 200:
+                break
+
+        if resp is None or resp.status_code != 200:
+            err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}") if resp else "Gagal koneksi"
             return (False, f"API Error: {err_msg[:35]}")
 
         raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
