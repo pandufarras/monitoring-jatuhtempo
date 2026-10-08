@@ -291,13 +291,13 @@ def get_valid_gemini_endpoint(api_key: str) -> str:
 def analyze_document_with_gemini(img_url: str) -> tuple:
     api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
     if not api_key:
-        return (False, "API Key belum disetel di Secrets")
+        return (False, "API Key kosong di Secrets")
 
     try:
-        # 1. Unduh dan perkecil gambar
+        # 1. Unduh gambar
         resp_img = requests.get(img_url, timeout=12, verify=False)
         if resp_img.status_code != 200:
-            return (False, "Gagal mengunduh gambar")
+            return (False, f"Gagal unduh gambar: HTTP {resp_img.status_code}")
 
         img = Image.open(io.BytesIO(resp_img.content)).convert("RGB")
         img.thumbnail((700, 700), Image.LANCZOS)
@@ -328,43 +328,20 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             }
         }
 
-        # 2. Cek otomatis model mana yang diizinkan oleh API Key Anda
-        url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        res_list = requests.get(url_list, timeout=10)
-        
-        target_model_name = ""
-        if res_list.status_code == 200:
-            models_data = res_list.json().get("models", [])
-            # Ambil semua model yang mendukung fungsi generateContent
-            tersedia = [
-                m["name"] for m in models_data 
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-            # Prioritaskan varian flash/multimodal yang aktif
-            for preferred in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]:
-                for t in tersedia:
-                    if preferred in t:
-                        target_model_name = t
-                        break
-                if target_model_name:
-                    break
-            
-            # Jika tidak ada yang cocok, gunakan model pertama yang tersedia
-            if not target_model_name and tersedia:
-                target_model_name = tersedia[0]
-
-        # Fallback jika list gagal diambil
-        if not target_model_name:
-            target_model_name = "models/gemini-2.0-flash"
-
-        # 3. Tembak endpoint dengan nama model resmi yang sudah diverifikasi ada
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/{target_model_name}:generateContent?key={api_key}"
+        # 2. Panggil API Google
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
         resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
 
+        # 3. Tampilkan pesan mentah jika gagal
         if resp.status_code != 200:
-            err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
-            return (False, f"API Error: {err_msg[:35]}")
+            try:
+                data_err = resp.json()
+                pesan_asli = data_err.get("error", {}).get("message", resp.text)
+                return (False, f"HTTP {resp.status_code}: {pesan_asli[:60]}")
+            except Exception:
+                return (False, f"HTTP {resp.status_code}: {resp.text[:60]}")
 
+        # 4. Parsing hasil jika berhasil
         raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
         clean_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
         data = json.loads(clean_text)
@@ -374,7 +351,7 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         return (is_v, alasan)
 
     except Exception as e:
-        return (False, f"Gagal AI: {str(e)[:30]}")
+        return (False, f"Exception: {str(e)[:40]}")
 # ========================================================
 # FUNGSI BANTUAN OPERASIONAL
 # ========================================================
