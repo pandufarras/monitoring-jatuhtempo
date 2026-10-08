@@ -858,11 +858,12 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             ket_txt = row["Penjelasan Invalid"] if str(row["Penjelasan Invalid"]).strip() else "-"
 
             table_rows.append(
-                f"<tr style='border-bottom: 1px solid #cbd5e1; background-color: #ffffff; font-size: 13px;'>"
+                f"<tr style='border-bottom: 1px solid {border_row_color}; background-color: {bg_row_color}; font-size: 13px;'>"
                 f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
                 f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
-                f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><b>{row['nama penerima']}</b><br><span style='color: #64748b; font-size: 11px;'>{row['alamat penerima']}</span></td>"
+                # KOLOM ALAMAT PENERIMA SAJA (Nama penerima dihapus dari baris ini agar tidak duplikat)
+                f"<td style='padding: 10px 8px; color: #334155; font-size: 12px; border-right: 1px solid #e2e8f0;'>{row['alamat penerima']}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_ktp}</td>"
@@ -876,7 +877,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             f"<div style='background-color: #ffffff; color: #000000; text-align: center; padding: 10px 6px; font-size: 16px; font-weight: 900; letter-spacing: 0.5px; border-bottom: 2px solid #111;'>{header_label}</div>"
             f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
             f"<thead><tr style='background-color: {header_bg}; color: #ffffff; font-size: 13px; text-align: center;'>"
-            f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Penerima & Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
+            f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
             f"</tr></thead>"
             f"<tbody>{''.join(table_rows)}</tbody>"
             f"</table>"
