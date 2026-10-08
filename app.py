@@ -870,7 +870,8 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             if df_sub.empty:
                 continue
 
-            warna_hdr = WARNA_LIST[idx_p % 2]
+            warna_hdr = "#002060" # atau sesuaikan dengan logika warna Anda
+
             render_tabel_kartu_ma(p_label, df_sub, header_bg=warna_hdr)
 
             c_ai, c_edit = st.columns([1, 2])
