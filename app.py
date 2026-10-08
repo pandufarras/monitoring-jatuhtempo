@@ -244,6 +244,10 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
 def analyze_document_with_gemini(img_url: str) -> tuple:
+    """
+    Analisis dokumen identitas dengan Google Gemini.
+    Otomatis mendeteksi SDK google-genai baru atau google-generativeai lama.
+    """
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         return (False, "API Key Gemini belum disetel di secrets.toml")
@@ -258,10 +262,6 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         img.save(buf, format="JPEG", quality=85)
         clean_jpg_bytes = buf.getvalue()
 
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
         prompt = (
             "Periksa apakah gambar ini adalah dokumen identitas resmi penduduk "
             "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
@@ -273,36 +273,49 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
         )
 
-        for target_model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
-            try:
-                response = client.models.generate_content(
-                    model=target_model,
-                    contents=[
-                        types.Part.from_bytes(data=clean_jpg_bytes, mime_type="image/jpeg"),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
-                )
-                data = json.loads(response.text)
-                is_v = bool(data.get("valid", False))
-                alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
-                return (is_v, alasan)
-            except Exception as e_inner:
-                if "404" in str(e_inner) or "not found" in str(e_inner).lower():
-                    continue
-                raise e_inner
+        teks_hasil = ""
 
-        return (False, "Model Gemini tidak tersedia")
+        # Opsi 1: Coba gunakan SDK baru (google-genai)
+        try:
+            from google import genai
+            from google.genai import types
+
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_bytes(data=clean_jpg_bytes, mime_type="image/jpeg"),
+                    prompt
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            teks_hasil = response.text
+        except (ImportError, AttributeError):
+            # Opsi 2: Fallback ke SDK lama (google-generativeai)
+            import google.generativeai as genai_old
+
+            genai_old.configure(api_key=api_key)
+            model = genai_old.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content([
+                {"mime_type": "image/jpeg", "data": clean_jpg_bytes},
+                prompt
+            ])
+            teks_hasil = response.text
+
+        # Bersihkan blok markdown ```json jika ada
+        teks_clean = re.sub(r"^```json\s*|\s*```$", "", teks_hasil.strip())
+        data = json.loads(teks_clean)
+        is_v = bool(data.get("valid", False))
+        alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
+        return (is_v, alasan)
 
     except Exception as e:
         err_msg = str(e)
         if "API_KEY_INVALID" in err_msg:
             return (False, "API Key salah/tidak aktif")
         return (False, f"Gagal AI: {err_msg[:30]}")
-
-
 # ========================================================
 # FUNGSI BANTUAN OPERASIONAL
 # ========================================================
