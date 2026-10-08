@@ -544,11 +544,11 @@ else:
 st.markdown("---")
 
 # ========================================================
-# TABEL RINCIAN LENGKAP UTAMA (DENGAN KLIK CONNOTE PID)
+# TABEL RINCIAN LENGKAP UTAMA (KLIK CONNOTE ASLI DENGAN PID)
 # ========================================================
 st.subheader("📋 Daftar Rincian Kiriman (Keseluruhan)")
 
-search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="Ketik kata kunci...")
+search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="Ketik kata kunci pencarian...")
 if search_kw:
     kw = search_kw.lower()
     cols_search = ["connote", "Penerima", "Alamat", "KC/KCP", "Petugas Update", "Status SLA"]
@@ -556,12 +556,21 @@ if search_kw:
         df_filtered[cols_search].astype(str).apply(lambda row: row.str.lower().str.contains(kw)).any(axis=1)
     ]
 
+# Buat nomor urut
 df_filtered = df_filtered.reset_index(drop=True)
 df_filtered.insert(0, "nomor", df_filtered.index + 1)
 
+# Format kolom connote menjadi teks resi asli yang dibungkus tag <a>
+df_display = df_filtered.copy()
+df_display["connote"] = df_display.apply(
+    lambda r: f'<a href="{r["url_lacak"]}" target="_blank" style="color: #002060; font-weight: bold; text-decoration: underline;">{r["connote"]}</a>' 
+    if r["url_lacak"] else r["connote"], 
+    axis=1
+)
+
 cols_to_render = [
     "nomor",
-    "url_lacak",
+    "connote",
     "KC/KCP",
     "Petugas Update",
     "Status SLA",
@@ -577,26 +586,26 @@ cols_to_render = [
     "Kendali"
 ]
 
-cols_valid = [c for c in cols_to_render if c in df_filtered.columns]
+cols_valid = [c for c in cols_to_render if c in df_display.columns]
 
-# Konfigurasi agar kolom url_lacak berlabel 'connote' dan dapat langsung diklik
-column_config = {
-    "url_lacak": st.column_config.LinkColumn(
-        label="connote",
-        display_text=r"https://pid\.posindonesia\.co\.id/lacak/admin/detail_lacak_banyak\.php\?id=(.*)",
-        help="Klik nomor resi untuk membuka detail lacak PID Pos Indonesia"
-    )
-}
-
-st.dataframe(
-    df_filtered[cols_valid],
-    column_config=column_config,
-    use_container_width=True,
-    height=400,
-    hide_index=True
+# Render tabel HTML responsif dengan sticky header dan horizontal scroll
+table_html = df_display[cols_valid].to_html(escape=False, index=False)
+st.markdown(
+    f"""
+    <div style="max-height: 480px; overflow-y: auto; overflow-x: auto; border: 1px solid #cbd5e1; border-radius: 8px; margin-bottom: 20px;">
+        <style>
+            .dataframe {{ width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; font-size: 13px; }}
+            .dataframe th {{ background-color: #f1f5f9; color: #334155; position: sticky; top: 0; padding: 10px 8px; border-bottom: 2px solid #cbd5e1; z-index: 1; text-align: left; }}
+            .dataframe td {{ padding: 8px 8px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
+            .dataframe tr:hover {{ background-color: #f8fafc; }}
+        </style>
+        {table_html}
+    </div>
+    """,
+    unsafe_allow_html=True
 )
 
-# Export CSV (menggunakan kolom connote teks biasa)
+# Export CSV (menggunakan nomor resi asli teks murni tanpa link)
 df_export = df_filtered.copy()
 if "url_lacak" in df_export.columns:
     df_export = df_export.drop(columns=["url_lacak"])
