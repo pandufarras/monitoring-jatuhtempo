@@ -6,6 +6,7 @@ import re
 import urllib.parse
 from difflib import SequenceMatcher
 
+import extra_streamlit_components as stx
 from PIL import Image, ImageOps
 import pandas as pd
 import requests
@@ -29,30 +30,60 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-def check_login():
-    """Memeriksa apakah pengguna sudah berhasil login."""
+
+# Endpoint & Kredensial Elasticsearch Mile App
+URL_ES = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
+HEADERS_ES = {"Content-Type": "application/json", "kbn-xsrf": "true"}
+
+AUTH_USER = st.secrets.get("ES_USER")
+AUTH_PASS = st.secrets.get("ES_PASS")
+AUTH_ES = (AUTH_USER, AUTH_PASS)
+
+
+# ========================================================
+# MANAJEMEN AUTENTIKASI & SESSION COOKIE LINTAS TAB
+# ========================================================
+def get_cookie_manager():
+    return stx.CookieManager(key="auth_cookies")
+
+cookie_manager = get_cookie_manager()
+
+def check_login() -> bool:
+    # 1. Cek sesi aktif di session_state saat ini
     if st.session_state.get("authenticated", False):
         return True
 
-    # Ambil kredensial dari secrets atau fallback default jika belum disetel
+    # 2. Cek token di cookie browser agar tab baru otomatis login
+    auth_token = cookie_manager.get("kc_sampang_auth")
+    if auth_token == "logged_in":
+        st.session_state["authenticated"] = True
+        return True
+
+    # 3. Ambil kredensial dari st.secrets (tidak ada hardcode username/password)
     cfg_auth = st.secrets.get("credentials", {})
     valid_user = cfg_auth.get("username")
     valid_pass = cfg_auth.get("password")
 
-    # Tampilan form login sederhana dan rapi di tengah
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
+    if not valid_user or not valid_pass:
+        st.error("Kredensial login belum disetel pada Secrets dashboard Streamlit.")
+        st.stop()
+
+    _, col_form, _ = st.columns([1, 1.5, 1])
+    with col_form:
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.subheader("🔒 Login KC Sampang")
-        
+
         with st.form("form_login"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
+            username_input = st.text_input("Username")
+            password_input = st.text_input("Password", type="password")
             submit = st.form_submit_button("Masuk", use_container_width=True)
 
             if submit:
-                if username == valid_user and password == valid_pass:
+                if username_input == valid_user and password_input == valid_pass:
                     st.session_state["authenticated"] = True
+                    # Cookie aktif selama 7 hari
+                    expires = datetime.datetime.now() + datetime.timedelta(days=7)
+                    cookie_manager.set("kc_sampang_auth", "logged_in", expires_at=expires)
                     st.success("Login berhasil!")
                     st.rerun()
                 else:
@@ -60,19 +91,9 @@ def check_login():
 
     return False
 
-# Panggil pencegat login sebelum menu atau data dimuat
+# Jalankan gatekeeper: Hentikan eksekusi dashboard jika belum terautentikasi
 if not check_login():
-    st.stop()  # Hentikan eksekusi kode dashboard di bawahnya jika belum login
-# Endpoint & Kredensial Elasticsearch Mile App
-if st.sidebar.button("🚪 Keluar (Logout)"):
-    st.session_state["authenticated"] = False
-    st.rerun()
-URL_ES = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
-HEADERS_ES = {"Content-Type": "application/json", "kbn-xsrf": "true"}
-
-AUTH_USER = st.secrets.get("ES_USER")
-AUTH_PASS = st.secrets.get("ES_PASS")
-AUTH_ES = (AUTH_USER, AUTH_PASS)
+    st.stop()
 
 
 # ========================================================
@@ -96,7 +117,6 @@ def _norm_text(t: str) -> str:
 
 
 def _kw_cocok(kw: str, words: list) -> bool:
-    """Cocok persis atau fuzzy (>= 0.82) agar toleran salah baca OCR."""
     parts = kw.split()
     n = len(parts)
     if n == 1 and len(kw) <= 3:
@@ -110,7 +130,6 @@ def _kw_cocok(kw: str, words: list) -> bool:
 
 
 def _skor_teks_identitas(teks: str) -> tuple:
-    """Return (kuat, pendukung, ada_nik_16digit)."""
     norm = _norm_text(teks)
     words = norm.split()
     kuat = sum(1 for k in KW_KUAT if _kw_cocok(k, words))
@@ -121,7 +140,6 @@ def _skor_teks_identitas(teks: str) -> tuple:
 
 
 def ocr_identity_check(img: Image.Image) -> tuple:
-    """Baca teks di gambar pada 4 orientasi; berhenti begitu terbukti dokumen identitas."""
     if not OCR_TERSEDIA:
         return (False, "OCR tidak tersedia")
     try:
@@ -164,19 +182,13 @@ def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
         for r, g, b in pixels:
             diff_max = max(abs(r - g), abs(g - b), abs(r - b))
 
-            # 1. Teks Hitam / Garis Tabel
             if r < 120 and g < 120 and b < 120 and diff_max <= 30:
                 dark_text += 1
-
-            # 2. Kertas Dokumen
             elif 80 <= r <= 255 and 80 <= g <= 255 and 70 <= b <= 255 and diff_max <= 40:
                 paper_doc += 1
-
-            # 3. Biru / Cyan e-KTP
             elif b >= 50 and b > r * 1.05 and (b >= g or abs(b - g) <= 35):
                 ktp_cyan += 1
 
-            # 4. Bubble WhatsApp
             if 5 <= r <= 50 and 65 <= g <= 135 and 45 <= b <= 115 and g > r * 1.4 and g > b:
                 wa_bubble += 1
             elif 190 <= r <= 235 and 230 <= g <= 255 and 190 <= b <= 235 and g > r + 5 and g > b + 5:
@@ -187,11 +199,9 @@ def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
         pct_paper = (paper_doc / total_p) * 100
         pct_text = (dark_text / total_p) * 100
 
-        # 1. PENCEGAT MUTLAK SCREENSHOT WHATSAPP
         if aspect_ratio >= 1.50 and pct_wa >= 0.5 and pct_cyan < 2.0:
             return (False, "Foto terdeteksi screenshot chat WA")
 
-        # 2. VALIDASI DOKUMEN IDENTITAS
         if pct_paper >= 15.0 and pct_text >= 2.5:
             return (True, "")
         if pct_text >= 5.0:
@@ -199,17 +209,14 @@ def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
         if pct_cyan >= 1.0:
             return (True, "")
 
-        # 3. LAPISAN A: OCR
         if OCR_TERSEDIA:
             ok, _alasan = ocr_identity_check(img)
             if ok:
                 return (True, "")
 
-        # 4. LAPISAN B: Fallback warna jika OCR tidak ada
         if not OCR_TERSEDIA and pct_paper >= 20.0 and pct_text >= 1.5:
             return (True, "")
 
-        # 5. BUKAN DOKUMEN
         return (False, "Bukan pola dokumen KTP/KK/Identitas")
 
     except Exception as e:
@@ -244,10 +251,6 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
 def analyze_document_with_gemini(img_url: str) -> tuple:
-    """
-    Analisis dokumen identitas dengan Google Gemini.
-    Otomatis mendeteksi SDK google-genai baru atau google-generativeai lama.
-    """
     api_key = st.secrets.get("GEMINI_API_KEY")
     if not api_key:
         return (False, "API Key Gemini belum disetel di secrets.toml")
@@ -275,7 +278,7 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
 
         teks_hasil = ""
 
-        # Opsi 1: Coba gunakan SDK baru (google-genai)
+        # Deteksi otomatis pustaka google-genai atau google.generativeai
         try:
             from google import genai
             from google.genai import types
@@ -293,7 +296,6 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             )
             teks_hasil = response.text
         except (ImportError, AttributeError):
-            # Opsi 2: Fallback ke SDK lama (google-generativeai)
             import google.generativeai as genai_old
 
             genai_old.configure(api_key=api_key)
@@ -304,7 +306,6 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             ])
             teks_hasil = response.text
 
-        # Bersihkan blok markdown ```json jika ada
         teks_clean = re.sub(r"^```json\s*|\s*```$", "", teks_hasil.strip())
         data = json.loads(teks_clean)
         is_v = bool(data.get("valid", False))
@@ -316,6 +317,8 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         if "API_KEY_INVALID" in err_msg:
             return (False, "API Key salah/tidak aktif")
         return (False, f"Gagal AI: {err_msg[:30]}")
+
+
 # ========================================================
 # FUNGSI BANTUAN OPERASIONAL
 # ========================================================
@@ -472,9 +475,16 @@ def render_metric_card(title: str, value: int, badge_text: str = "", badge_bg: s
 
 
 # ========================================================
-# NAVIGASI MENU SIDEBAR
+# NAVIGASI MENU SIDEBAR & LOGOUT
 # ========================================================
 st.sidebar.title("🎛️ Navigasi Menu")
+
+if st.sidebar.button("🚪 Keluar (Logout)"):
+    st.session_state["authenticated"] = False
+    cookie_manager.delete("kc_sampang_auth")
+    st.rerun()
+
+st.sidebar.markdown("---")
 menu_pilihan = st.sidebar.radio(
     "Pilih Dashboard:",
     ["📦 Monitoring Jatuh Tempo", "⚖️ Uji Petik Mahkamah Agung (PA/PN)"],
@@ -875,7 +885,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
 
             is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
 
-            # BARIS BERWARNA MERAH MUDA & BORDER MERAH BILA INVALID[cite: 1]
+            # Baris tabel merah muda bila INVALID
             if is_valid:
                 row_bg = "#ffffff"
                 border_b = "1px solid #cbd5e1"
@@ -893,6 +903,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
                 f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
                 f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
+                # Kolom hanya menampilkan alamat tanpa nama penerima
                 f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><span style='color: #1e293b; font-size: 12px; font-weight: 500;'>{row['alamat penerima']}</span></td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
                 f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
