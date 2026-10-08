@@ -252,21 +252,39 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # ========================================================
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
+@st.cache_data(ttl=3600)
+def get_active_gemini_model(api_key: str) -> str:
+    """Mengambil otomatis model multimodal yang aktif di akun API key."""
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            models = [m.get("name", "") for m in res.json().get("models", [])]
+            # Prioritaskan flash terbaru yang mendukung generateContent
+            for target in ["models/gemini-2.0-flash", "models/gemini-1.5-flash", "models/gemini-1.5-flash-latest", "models/gemini-1.5-pro"]:
+                if target in models:
+                    return target.replace("models/", "")
+            for m in models:
+                if "flash" in m and "generateContent" in str(res.json()):
+                    return m.replace("models/", "")
+    except Exception:
+        pass
+    return "gemini-2.0-flash"
+
+
 def analyze_document_with_gemini(img_url: str) -> tuple:
-    api_key = st.secrets.get("GEMINI_API_KEY")
+    api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
     if not api_key:
-        return (False, "API Key Gemini belum disetel di secrets.toml")
+        return (False, "API Key belum disetel di Secrets")
 
     try:
-        # 1. Unduh dan kompres ukuran foto agar payload ringan & cepat
+        # 1. Unduh dan perkecil ukuran gambar
         resp_img = requests.get(img_url, timeout=12, verify=False)
         if resp_img.status_code != 200:
             return (False, "Gagal mengunduh gambar")
 
         img = Image.open(io.BytesIO(resp_img.content)).convert("RGB")
-        # Resize sisi terpanjang ke maks 800px untuk menghemat bandwidth
-        img.thumbnail((800, 800), Image.LANCZOS)
-        
+        img.thumbnail((700, 700), Image.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
         img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
@@ -274,74 +292,46 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         prompt_text = (
             "Periksa apakah gambar ini adalah dokumen identitas resmi penduduk "
             "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
-            "Jika gambar merupakan wajah orang/selfie saja tanpa identitas, foto rumah, teras, pagar, "
-            "plang kantor desa, jalan, dokumen amplop saja tanpa KTP, atau screenshot obrolan WhatsApp, "
-            "maka itu BUKAN dokumen identitas.\n"
-            "Wajib jawab HANYA dalam format JSON persis: "
+            "Jika berupa foto wajah/selfie saja, rumah, jalan, plang kantor, amplop tanpa KTP, atau screenshot chat, "
+            "maka BUKAN dokumen identitas.\n"
+            "Wajib jawab HANYA format JSON persis: "
             "{\"valid\": true, \"alasan\": \"KTP/KK sah\"} atau "
             "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
         )
 
-        # 2. Struktur Payload REST API Resmi (Wajib camelCase: inlineData & mimeType)
+        # 2. Ambil nama model valid secara otomatis
+        model_name = get_active_gemini_model(api_key)
+
+        # 3. Request ke API Gemini
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "inlineData": {
-                                "mimeType": "image/jpeg",
-                                "data": img_b64
-                            }
-                        },
-                        {
-                            "text": prompt_text
-                        }
-                    ]
-                }
-            ],
+            "contents": [{
+                "parts": [
+                    {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
+                    {"text": prompt_text}
+                ]
+            }],
             "generationConfig": {
                 "responseMimeType": "application/json"
             }
         }
 
-        # 3. Kirim ke model stable gemini-1.5-flash
-        # Coba daftar model yang tersedia (dari latest hingga versi dasar)
-        daftar_model = [
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-flash",
-            "gemini-2.0-flash",
-            "gemini-2.5-flash"
-        ]
-        
-        headers = {"Content-Type": "application/json"}
-        resp = None
+        resp = requests.post(api_url, headers={"Content-Type": "application/json"}, json=payload, timeout=25)
 
-        for model_name in daftar_model:
-            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-            resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
-            # Jika tidak 404 (model ditemukan), keluar dari loop pencarian model
-            if resp.status_code != 404:
-                break
+        if resp.status_code != 200:
+            err_msg = resp.json().get("error", {}).get("message", f"HTTP {resp.status_code}")
+            return (False, f"API Error: {err_msg[:35]}")
 
-        if resp is None or resp.status_code != 200:
-            try:
-                err_detail = resp.json().get("error", {}).get("message", resp.text[:40])
-                return (False, f"API Error: {err_detail[:35]}")
-            except Exception:
-                return (False, f"HTTP {resp.status_code if resp else 'Error'}")
-
-        teks_clean = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
-        data = json.loads(teks_clean)
+        raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        clean_text = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
+        data = json.loads(clean_text)
 
         is_v = bool(data.get("valid", False))
         alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
         return (is_v, alasan)
 
     except Exception as e:
-        err_msg = str(e)
-        if "API_KEY_INVALID" in err_msg:
-            return (False, "API Key salah/tidak aktif")
-        return (False, f"Gagal AI: {err_msg[:30]}")
+        return (False, f"Gagal AI: {str(e)[:30]}")
 # ========================================================
 # FUNGSI BANTUAN OPERASIONAL
 # ========================================================
