@@ -305,20 +305,30 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         }
 
         # 3. Kirim ke model stable gemini-1.5-flash
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-        headers = {"Content-Type": "application/json"}
+        # Coba daftar model yang tersedia (dari latest hingga versi dasar)
+        daftar_model = [
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash"
+        ]
         
-        resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
+        headers = {"Content-Type": "application/json"}
+        resp = None
 
-        if resp.status_code != 200:
+        for model_name in daftar_model:
+            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
+            # Jika tidak 404 (model ditemukan), keluar dari loop pencarian model
+            if resp.status_code != 404:
+                break
+
+        if resp is None or resp.status_code != 200:
             try:
                 err_detail = resp.json().get("error", {}).get("message", resp.text[:40])
                 return (False, f"API Error: {err_detail[:35]}")
             except Exception:
-                return (False, f"HTTP {resp.status_code}")
-
-        res_json = resp.json()
-        raw_text = res_json["candidates"][0]["content"]["parts"][0]["text"]
+                return (False, f"HTTP {resp.status_code if resp else 'Error'}")
 
         teks_clean = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip())
         data = json.loads(teks_clean)
