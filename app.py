@@ -548,4 +548,63 @@ st.markdown("---")
 # ========================================================
 st.subheader("📋 Daftar Rincian Kiriman (Keseluruhan)")
 
-search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="K
+search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="Ketik kata kunci...")
+if search_kw:
+    kw = search_kw.lower()
+    cols_search = ["connote", "Penerima", "Alamat", "KC/KCP", "Petugas Update", "Status SLA"]
+    df_filtered = df_filtered[
+        df_filtered[cols_search].astype(str).apply(lambda row: row.str.lower().str.contains(kw)).any(axis=1)
+    ]
+
+df_filtered = df_filtered.reset_index(drop=True)
+df_filtered.insert(0, "nomor", df_filtered.index + 1)
+
+cols_to_render = [
+    "nomor",
+    "url_lacak",
+    "KC/KCP",
+    "Petugas Update",
+    "Status SLA",
+    "Tgl Jatuh Tempo",
+    "Tgl Update",
+    "Status",
+    "Layanan",
+    "Penerima",
+    "Alamat",
+    "First Attempt",
+    "Alasan Gagal Antar",
+    "Irregularity",
+    "Kendali"
+]
+
+cols_valid = [c for c in cols_to_render if c in df_filtered.columns]
+
+# Konfigurasi agar kolom url_lacak berlabel 'connote' dan dapat langsung diklik
+column_config = {
+    "url_lacak": st.column_config.LinkColumn(
+        label="connote",
+        display_text=r"https://pid\.posindonesia\.co\.id/lacak/admin/detail_lacak_banyak\.php\?id=(.*)",
+        help="Klik nomor resi untuk membuka detail lacak PID Pos Indonesia"
+    )
+}
+
+st.dataframe(
+    df_filtered[cols_valid],
+    column_config=column_config,
+    use_container_width=True,
+    height=400,
+    hide_index=True
+)
+
+# Export CSV (menggunakan kolom connote teks biasa)
+df_export = df_filtered.copy()
+if "url_lacak" in df_export.columns:
+    df_export = df_export.drop(columns=["url_lacak"])
+
+csv_bytes = df_export.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="📥 Unduh Data (CSV)",
+    data=csv_bytes,
+    file_name=f"jatuh_tempo_{kc_input}_{tgl_hari_ini}.csv",
+    mime="text/csv"
+)
