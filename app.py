@@ -1,33 +1,514 @@
 import base64
 import datetime
+import io
 import json
+import re
 import urllib.parse
+from difflib import SequenceMatcher
+
+from PIL import Image, ImageOps
 import pandas as pd
 import requests
 import streamlit as st
 import urllib3
+from google import genai
+from google.genai import types
+
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+import io
+
+# OCR bersifat OPSIONAL: jika tidak terpasang, algoritma lama tetap jalan
+try:
+    import pytesseract
+    OCR_TERSEDIA = True
+except Exception:
+    OCR_TERSEDIA = False
 
 # Nonaktifkan warning SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- KONFIGURASI HALAMAN ---
+# --- KONFIGURASI HALAMAN WAJIB PALING ATAS ---
 st.set_page_config(
-    page_title="Monitoring Kiriman Jatuh Tempo",
-    page_icon="📦",
-    layout="wide"
+    page_title="Dashboard Operasional KC Sampang",
+    page_icon="📮",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # Endpoint & Kredensial Elasticsearch Mile App
-URL = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
-HEADERS = {"Content-Type": "application/json", "kbn-xsrf": "true"}
+URL_ES = "https://board.mile.app/elasticsearch/expos.package_connote.pos.*/_search"
+HEADERS_ES = {"Content-Type": "application/json", "kbn-xsrf": "true"}
 
 AUTH_USER = st.secrets.get("ES_USER", "upt")
 AUTH_PASS = st.secrets.get("ES_PASS", "posind3m4s")
-AUTH = (AUTH_USER, AUTH_PASS)
+AUTH_ES = (AUTH_USER, AUTH_PASS)
 
 
+# ========================================================
+# 1A. LAPISAN OCR: BACA TEKS PADA GAMBAR (tahan blur, tint, rotasi)
+# ========================================================
+# Kata kunci KUAT = hampir pasti hanya ada di KTP/KK/SIM
+KW_KUAT = [
+    "NIK", "PROVINSI", "KEWARGANEGARAAN", "GOL DARAH", "STATUS PERKAWINAN",
+    "BERLAKU HINGGA", "JENIS KELAMIN", "TEMPAT TGL LAHIR", "KARTU KELUARGA",
+    "KEPALA KELUARGA", "NO KK", "NAMA LENGKAP", "SURAT IZIN MENGEMUDI",
+]
+# Kata kunci PENDUKUNG = bisa muncul juga di alamat amplop, tidak cukup sendirian
+KW_PENDUKUNG = [
+    "KABUPATEN", "JAWA TIMUR", "AGAMA", "PEKERJAAN", "KEL DESA", "KECAMATAN",
+    "ISLAM", "WNI", "KAWIN", "WIRASWASTA", "LAKI LAKI", "PEREMPUAN",
+]
+
+
+def _norm_text(t: str) -> str:
+    t = t.upper()
+    t = re.sub(r"[^A-Z0-9 ]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _kw_cocok(kw: str, words: list) -> bool:
+    """Cocok persis atau fuzzy (>= 0.82) agar toleran salah baca OCR."""
+    parts = kw.split()
+    n = len(parts)
+    if n == 1 and len(kw) <= 3:
+        return kw in words
+    target = " ".join(parts)
+    for i in range(len(words) - n + 1):
+        cand = " ".join(words[i:i + n])
+        if cand == target or SequenceMatcher(None, cand, target).ratio() >= 0.82:
+            return True
+    return False
+
+
+def _skor_teks_identitas(teks: str) -> tuple:
+    """Return (kuat, pendukung, ada_nik_16digit)."""
+    norm = _norm_text(teks)
+    words = norm.split()
+    kuat = sum(1 for k in KW_KUAT if _kw_cocok(k, words))
+    pend = sum(1 for k in KW_PENDUKUNG if _kw_cocok(k, words))
+    digits_only = re.sub(r"(?<=\d) (?=\d)", "", norm)
+    ada_nik = bool(re.search(r"\b\d{14,17}\b", digits_only))
+    return kuat, pend, ada_nik
+
+
+def ocr_identity_check(img: Image.Image) -> tuple:
+    """Baca teks di gambar pada 4 orientasi; berhenti begitu terbukti dokumen identitas."""
+    if not OCR_TERSEDIA:
+        return (False, "OCR tidak tersedia")
+    try:
+        gray = ImageOps.grayscale(img)
+        w, h = gray.size
+        scale = 1100 / max(w, 1)
+        if scale != 1:
+            gray = gray.resize((1100, max(1, int(h * scale))), Image.LANCZOS)
+        gray = ImageOps.autocontrast(gray, cutoff=2)  # netralkan tint & foto redup
+
+        for angle in (0, 270, 90, 180):
+            g = gray if angle == 0 else gray.rotate(angle, expand=True)
+            teks = pytesseract.image_to_string(g, config="--psm 11", timeout=10)
+            kuat, pend, nik = _skor_teks_identitas(teks)
+            if (kuat >= 1 and kuat + pend >= 2) or kuat >= 2 or (nik and (kuat + pend) >= 1):
+                return (True, "Teks identitas terbaca (OCR)")
+        return (False, "Teks KTP/KK tidak terbaca")
+    except Exception as e:
+        return (False, f"OCR gagal: {str(e)[:20]}")
+
+
+# ========================================================
+# 1B. ALGORITMA HEURISTIK CITRA DOKUMEN IDENTITAS (TAHAP 1)
+# ========================================================
+def inspect_image_is_identity_document(img_bytes: bytes) -> tuple:
+    """
+    Heuristik warna kertas + kepadatan teks (logika lama tetap),
+    ditambah OCR sebagai pencegat terakhir sebelum vonis 'bukan dokumen'.
+    """
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w_orig, h_orig = img.size
+        aspect_ratio = h_orig / max(w_orig, 1)
+
+        img_thumb = img.resize((150, 150))
+        pixels = list(img_thumb.getdata())
+        total_p = len(pixels)
+
+        ktp_cyan = 0
+        dark_text = 0
+        paper_doc = 0
+        wa_bubble = 0
+
+        for r, g, b in pixels:
+            diff_max = max(abs(r - g), abs(g - b), abs(r - b))
+
+            # 1. Teks Hitam / Garis Tabel
+            if r < 120 and g < 120 and b < 120 and diff_max <= 30:
+                dark_text += 1
+
+            # 2. Kertas Dokumen
+            elif 80 <= r <= 255 and 80 <= g <= 255 and 70 <= b <= 255 and diff_max <= 40:
+                paper_doc += 1
+
+            # 3. Biru / Cyan e-KTP
+            elif b >= 50 and b > r * 1.05 and (b >= g or abs(b - g) <= 35):
+                ktp_cyan += 1
+
+            # 4. Bubble WhatsApp
+            if 5 <= r <= 50 and 65 <= g <= 135 and 45 <= b <= 115 and g > r * 1.4 and g > b:
+                wa_bubble += 1
+            elif 190 <= r <= 235 and 230 <= g <= 255 and 190 <= b <= 235 and g > r + 5 and g > b + 5:
+                wa_bubble += 1
+
+        pct_wa = (wa_bubble / total_p) * 100
+        pct_cyan = (ktp_cyan / total_p) * 100
+        pct_paper = (paper_doc / total_p) * 100
+        pct_text = (dark_text / total_p) * 100
+
+        # 1. PENCEGAT MUTLAK SCREENSHOT WHATSAPP
+        if aspect_ratio >= 1.50 and pct_wa >= 0.5 and pct_cyan < 2.0:
+            return (False, "Foto terdeteksi screenshot chat WA")
+
+        # 2. VALIDASI DOKUMEN IDENTITAS (aturan lama)
+        if pct_paper >= 15.0 and pct_text >= 2.5:
+            return (True, "")
+        if pct_text >= 5.0:
+            return (True, "")
+        if pct_cyan >= 1.0:
+            return (True, "")
+
+        # 3. LAPISAN BARU A: OCR (KTP blur / tint / miring / di atas amplop / ada stempel GPS)
+        if OCR_TERSEDIA:
+            ok, _alasan = ocr_identity_check(img)
+            if ok:
+                return (True, "")
+
+        # 4. LAPISAN BARU B: fallback warna lebih longgar, HANYA jika OCR tidak terpasang
+        if not OCR_TERSEDIA and pct_paper >= 20.0 and pct_text >= 1.5:
+            return (True, "")
+
+        # 5. BUKAN DOKUMEN
+        return (False, "Bukan pola dokumen KTP/KK/Identitas")
+
+    except Exception as e:
+        return (False, f"Gagal analisa: {str(e)[:25]}")
+
+
+def evaluate_two_photos(f1_url: str, f2_url: str) -> tuple:
+    """Evaluasi Foto 2 (Tempat KTP/KK semestinya diupload)."""
+    if not f1_url or not f2_url:
+        return ("INVALID", "Foto identitas tidak ada (kurang foto)")
+
+    if f1_url.strip() == f2_url.strip():
+        return ("INVALID", "Foto duplikat (kedua foto identik)")
+
+    try:
+        r2 = requests.get(f2_url, timeout=7, verify=False)
+        if r2.status_code == 200:
+            is_valid_2, alasan_2 = inspect_image_is_identity_document(r2.content)
+            if is_valid_2:
+                return ("VALID", "")
+            return ("INVALID", alasan_2)
+        return ("INVALID", "Gagal memuat foto dari server")
+    except Exception:
+        return ("INVALID", "Foto identitas tidak dapat diverifikasi")
+
+
+@st.cache_data(show_spinner=False)
+def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) -> tuple:
+    """Mencegah unduhan foto berulang setiap interaksi UI."""
+    return evaluate_two_photos(f1_url, f2_url)
+
+
+# ========================================================
+# 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
+# ========================================================
+def analyze_document_with_gemini(img_url: str) -> tuple:
+    """
+    Analisis visual presisi menggunakan Gemini.
+    Menjamin gambar di-encode ulang ke JPEG murni agar bebas error 400.
+    """
+    api_key = st.secrets.get("GEMINI_API_KEY")
+    if not api_key:
+        return (False, "API Key Gemini belum disetel di secrets.toml")
+
+    try:
+        resp = requests.get(img_url, timeout=12, verify=False)
+        if resp.status_code != 200:
+            return (False, "Gagal mengunduh gambar")
+
+        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        clean_jpg_bytes = buf.getvalue()
+
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            "Periksa apakah gambar ini adalah dokumen identitas resmi penduduk "
+            "(e-KTP fisik, Kartu Keluarga/KK, SIM, atau fotokopi KTP/KK yang terbaca). "
+            "Jika gambar merupakan wajah orang/selfie saja tanpa identitas, foto rumah, teras, pagar, "
+            "plang kantor desa, jalan, dokumen amplop saja tanpa KTP, atau screenshot obrolan WhatsApp, "
+            "maka itu BUKAN dokumen identitas.\n"
+            "Wajib jawab HANYA dalam format JSON persis: "
+            "{\"valid\": true, \"alasan\": \"KTP/KK sah\"} atau "
+            "{\"valid\": false, \"alasan\": \"penjelasan ringkas maks 6 kata\"}"
+        )
+
+        for target_model in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+            try:
+                response = client.models.generate_content(
+                    model=target_model,
+                    contents=[
+                        types.Part.from_bytes(data=clean_jpg_bytes, mime_type="image/jpeg"),
+                        prompt
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json"
+                    )
+                )
+                data = json.loads(response.text)
+                is_v = bool(data.get("valid", False))
+                alasan = data.get("alasan", "Bukan dokumen KTP/KK" if not is_v else "")
+                return (is_v, alasan)
+            except Exception as e_inner:
+                if "404" in str(e_inner) or "not found" in str(e_inner).lower():
+                    continue
+                raise e_inner
+
+        return (False, "Model Gemini tidak tersedia")
+
+    except Exception as e:
+        err_msg = str(e)
+        if "API_KEY_INVALID" in err_msg:
+            return (False, "API Key salah/tidak aktif")
+        return (False, f"Gagal AI: {err_msg[:30]}")
+
+def generate_pdf_berita_acara(df_audit: pd.DataFrame, t_start, t_end) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=25,
+        leftMargin=25,
+        topMargin=25,
+        bottomMargin=25
+    )
+    
+    elements = []
+    styles = getSampleStyleSheet()
+    
+    # Custom Styles
+    title_style = ParagraphStyle(
+        'TitleStyle',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=12,
+        leading=15,
+        alignment=1, # Center
+        textColor=colors.HexColor('#0f172a')
+    )
+    
+    # Font tabel diperkecil agar muat banyak dan tidak boros space
+    cell_style = ParagraphStyle(
+        'CellStyle',
+        parent=styles['Normal'],
+        fontName='Helvetica',
+        fontSize=7,
+        leading=9,
+        textColor=colors.HexColor('#1e293b')
+    )
+    
+    cell_bold = ParagraphStyle(
+        'CellBold',
+        parent=cell_style,
+        fontName='Helvetica-Bold'
+    )
+    
+    cell_center = ParagraphStyle(
+        'CellCenter',
+        parent=cell_style,
+        alignment=1
+    )
+
+    cell_header = ParagraphStyle(
+        'CellHeader',
+        parent=styles['Normal'],
+        fontName='Helvetica-Bold',
+        fontSize=7.5,
+        leading=10,
+        alignment=1,
+        textColor=colors.white
+    )
+
+    # 1. KOP SURAT RESMI DENGAN LOGO POSIND DARI URL
+    logo_img = None
+    try:
+        logo_url = "https://admin-piol.posindonesia.co.id/media/PosIND_Main%20Color.png"
+        resp_img = requests.get(logo_url, timeout=5, verify=False)
+        if resp_img.status_code == 200:
+            logo_io = io.BytesIO(resp_img.content)
+            # Lebar 45pt, tinggi disesuaikan proporsional (~39pt)
+            logo_img = RLImage(logo_io, width=45, height=39)
+    except Exception:
+        logo_img = Paragraph("<b><font color='#002060' size='14'>POS</font><font color='#ff4500' size='14'> IND</font></b>", styles['Normal'])
+
+    instansi_p = Paragraph(
+        "<b>PT POS INDONESIA (PERSERO)</b><br/>"
+        "KANTOR POS KECAMATAN SAMPAH (69200) — KC SAMPANG<br/>"
+        "<font color='#475569'>Jl. Jamaluddin No. 4, Sampang, Jawa Timur 69211</font>",
+        ParagraphStyle('InstansiText', parent=styles['Normal'], fontSize=8.5, leading=12, alignment=2)
+    )
+
+    t_kop = Table([[logo_img, instansi_p]], colWidths=[60, 487])
+    t_kop.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('ALIGN', (0,0), (0,0), 'LEFT'),
+        ('ALIGN', (1,0), (1,0), 'RIGHT'),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+        ('LINEBELOW', (0,0), (-1,-1), 1.5, colors.HexColor('#002060')),
+    ]))
+    elements.append(t_kop)
+    elements.append(Spacer(1, 10))
+
+    # 2. JUDUL BERITA ACARA
+    elements.append(Paragraph("<b>BERITA ACARA UJI PETIK HARIAN KIRIMAN SURAT TERCATAT MAHKAMAH AGUNG</b>", title_style))
+    elements.append(Spacer(1, 3))
+    
+    periode_str = f"Periode Tanggal: {t_start.strftime('%d/%m/%Y')} s.d. {t_end.strftime('%d/%m/%Y')}"
+    elements.append(Paragraph(periode_str, ParagraphStyle('Sub', parent=title_style, fontName='Helvetica', fontSize=8.5, textColor=colors.HexColor('#475569'))))
+    elements.append(Spacer(1, 10))
+
+    # 3. TABEL RINGKASAN DATA
+    total_all = len(df_audit)
+    val_all = len(df_audit[df_audit["Hasil Investigasi"] == "VALID"])
+    inv_all = len(df_audit[df_audit["Hasil Investigasi"] == "INVALID"])
+    
+    summary_data = [
+        [Paragraph("<b>Keterangan</b>", cell_header), Paragraph("<b>Jumlah Resi</b>", cell_header), Paragraph("<b>Persentase</b>", cell_header)],
+        [Paragraph("Total Kiriman Uji Petik", cell_style), Paragraph(str(total_all), cell_center), Paragraph("100%", cell_center)],
+        [Paragraph("Antaran Valid", cell_style), Paragraph(str(val_all), cell_center), Paragraph(f"{round(val_all/total_all*100, 1) if total_all>0 else 0}%", cell_center)],
+        [Paragraph("Antaran Invalid (Perlu Pembinaan)", cell_style), Paragraph(str(inv_all), cell_center), Paragraph(f"{round(inv_all/total_all*100, 1) if total_all>0 else 0}%", cell_center)],
+    ]
+    
+    t_summary = Table(summary_data, colWidths=[247, 130, 170])
+    t_summary.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#002060')),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+        ('TOPPADDING', (0,0), (-1,-1), 4),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+    ]))
+    elements.append(t_summary)
+    elements.append(Spacer(1, 10))
+
+    # 4. TABEL RINCIAN AUDIT (FONT DIPERKECIL & PADDING RAPAT)
+    elements.append(Paragraph("<b>Rincian Hasil Pemeriksaan Dokumen Uji Petik:</b>", ParagraphStyle('SubDet', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8.5, textColor=colors.HexColor('#0f172a'))))
+    elements.append(Spacer(1, 4))
+
+    table_data = [[
+        Paragraph("No", cell_header),
+        Paragraph("Nomor Resi", cell_header),
+        Paragraph("Petugas & Kantor", cell_header),
+        Paragraph("Status Kiriman", cell_header),
+        Paragraph("Penerima", cell_header),
+        Paragraph("Hasil", cell_header),
+        Paragraph("Keterangan", cell_header),
+    ]]
+
+    for idx, row in df_audit.reset_index(drop=True).iterrows():
+        status_hasil = str(row["Hasil Investigasi"])
+        h_color = colors.HexColor('#15803d') if status_hasil == "VALID" else colors.HexColor('#b91c1c')
+        h_style = ParagraphStyle('HStyle', parent=cell_bold, textColor=h_color, alignment=1)
+
+        table_data.append([
+            Paragraph(str(idx + 1), cell_center),
+            Paragraph(str(row["connote"]), cell_bold),
+            Paragraph(str(row["petugas update"]) + f"<br/><font color='#64748b'>({row['kantor update']})</font>", cell_style),
+            Paragraph(str(row["status kiriman"]), cell_style),
+            Paragraph(str(row["nama penerima"]) + f"<br/><font color='#64748b'>{row['alamat penerima'][:35]}...</font>", cell_style),
+            Paragraph(status_hasil, h_style),
+            Paragraph(str(row["Penjelasan Invalid"]) if status_hasil == "INVALID" else "-", cell_style),
+        ])
+
+    # Lebar total kolom pas dengan margin halaman A4 (547 pt)
+    # Style khusus nomor resi agar ukurannya lebih kecil dan muat dalam 1 baris
+    cell_resi = ParagraphStyle(
+        'CellResi',
+        parent=cell_style,
+        fontName='Helvetica-Bold',
+        fontSize=6.5,
+        leading=8,
+        alignment=1
+    )
+
+    table_data = [[
+        Paragraph("No", cell_header),
+        Paragraph("Nomor Resi", cell_header),
+        Paragraph("Petugas & Kantor", cell_header),
+        Paragraph("Status Kiriman", cell_header),
+        Paragraph("Penerima", cell_header),
+        Paragraph("Hasil", cell_header),
+        Paragraph("Keterangan", cell_header),
+    ]]
+
+    for idx, row in df_audit.reset_index(drop=True).iterrows():
+        status_hasil = str(row["Hasil Investigasi"])
+        h_color = colors.HexColor('#15803d') if status_hasil == "VALID" else colors.HexColor('#b91c1c')
+        h_style = ParagraphStyle('HStyle', parent=cell_bold, textColor=h_color, alignment=1)
+
+        table_data.append([
+            Paragraph(str(idx + 1), cell_center),
+            Paragraph(str(row["connote"]), cell_resi), # Menggunakan cell_resi yang lebih kecil
+            Paragraph(str(row["petugas update"]) + f"<br/><font color='#64748b'>({row['kantor update']})</font>", cell_style),
+            Paragraph(str(row["status kiriman"]), cell_style),
+            Paragraph(str(row["nama penerima"]) + f"<br/><font color='#64748b'>{row['alamat penerima'][:30]}...</font>", cell_style),
+            Paragraph(status_hasil, h_style),
+            Paragraph(str(row["Penjelasan Invalid"]) if status_hasil == "INVALID" else "-", cell_style),
+        ])
+
+    # Lebar kolom "Nomor Resi" dilebarkan menjadi 75 pt agar tidak turun ke bawah
+    t_detail = Table(table_data, colWidths=[18, 75, 82, 72, 95, 38, 157])
+    t_detail.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#334155')),
+        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#cbd5e1')),
+        ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f8fafc')]),
+        ('TOPPADDING', (0,0), (-1,-1), 2.5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 2.5),
+    ]))
+    elements.append(t_detail)
+
+    # 5. BAGIAN TANDA TANGAN PEJABAT STRUKTURAL
+    tgl_cetak = datetime.date.today().strftime('%d %B %Y')
+    
+    sig_data = [
+        [
+            Paragraph("Mengetahui,<br/><b>Executive Manager</b>", ParagraphStyle('SigTitle', parent=cell_center, leading=13)),
+            Paragraph(f"Sampang, {tgl_cetak}<br/><b>Supervisor Operasi</b>", ParagraphStyle('SigTitle2', parent=cell_center, leading=13))
+        ],
+        [
+            Paragraph("<br/><br/><br/><b><u>Pandu Arif Farras</u></b><br/>Nippos. 995490806", ParagraphStyle('SigName', parent=cell_center, leading=13)),
+            Paragraph("<br/><br/><br/><b><u>Moh Saleh</u></b><br/>Nippos. 979376944", ParagraphStyle('SigName2', parent=cell_center, leading=13))
+        ]
+    ]
+
+    t_sig = Table(sig_data, colWidths=[273.5, 273.5])
+    t_sig.setStyle(TableStyle([
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+    ]))
+    
+    elements.append(KeepTogether(t_sig))
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.getvalue()
+# ========================================================
+# FUNGSI BANTUAN OPERASIONAL
+# ========================================================
 def generate_pid_url(connote_str: str) -> str:
-    """Mengubah nomor connote menjadi URL lacakan PID dengan Base64 + URL encode."""
     if not connote_str or connote_str == "-":
         return ""
     b64_val = base64.b64encode(str(connote_str).strip().encode("utf-8")).decode("utf-8")
@@ -35,83 +516,7 @@ def generate_pid_url(connote_str: str) -> str:
     return f"https://pid.posindonesia.co.id/lacak/admin/detail_lacak_banyak.php?id={param_val}"
 
 
-def build_payload(kc_code: str, start_date: datetime.date, end_date: datetime.date, max_size: int = 5000) -> dict:
-    """Membangun query pencarian Elasticsearch untuk rentang tanggal Jatuh Tempo."""
-    prev_start = start_date - datetime.timedelta(days=1)
-    gte_utc = f"{prev_start.strftime('%Y-%m-%d')}T17:00:00.000Z"
-    lte_utc = f"{end_date.strftime('%Y-%m-%d')}T16:59:59.999Z"
-
-    return {
-        "size": max_size,
-        "query": {
-            "bool": {
-                "filter": [
-                    {
-                        "bool": {
-                            "minimum_should_match": 1,
-                            "should": [
-                                {"match_phrase": {"connote.connote_service.keyword": "Q9"}},
-                                {"match_phrase": {"connote.connote_service.keyword": "PE"}},
-                                {"match_phrase": {"connote.connote_service.keyword": "PKH"}},
-                                {"match_phrase": {"connote.connote_service.keyword": "EC3"}},
-                            ],
-                        }
-                    },
-                    {
-                        "bool": {
-                            "filter": [
-                                {
-                                    "bool": {
-                                        "minimum_should_match": 1,
-                                        "should": [
-                                            {"query_string": {"fields": ["connote.connote_receiver_zipcode.keyword"], "query": "\\6*"}},
-                                            {"query_string": {"fields": ["connote.connote_receiver_zipcode.keyword"], "query": "\\8*"}},
-                                        ],
-                                    }
-                                }
-                            ]
-                        }
-                    },
-                    {"match_phrase": {"custom_field.destination_kprk.keyword": {"query": str(kc_code)}}},
-                    {
-                        "range": {
-                            "custom_field.final_swp_date_new": {
-                                "format": "strict_date_optional_time",
-                                "gte": gte_utc,
-                                "lte": lte_utc,
-                            }
-                        }
-                    },
-                ],
-                "must_not": [
-                    {
-                        "bool": {
-                            "should": [
-                                {"match_phrase": {"connote.connote_state.keyword": "DELIVERED"}},
-                                {"match_phrase": {"connote.connote_state.keyword": "DELIVERED (RETURN DELIVERY)"}},
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    },
-                    {
-                        "bool": {
-                            "should": [
-                                {"match_phrase": {"connote.connote_state.keyword": "CANCEL"}},
-                                {"match_phrase": {"connote.connote_state.keyword": "PENDING"}},
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    },
-                    {"match_phrase": {"connote.location_name.keyword": {"query": "AGP TESTING LOCATION"}}},
-                    {"match_phrase": {"connote.connote_service.keyword": {"query": "LNINCOMING"}}},
-                ],
-            }
-        },
-    }
-
-
 def format_tgl_update(raw_dt) -> str:
-    """Mengonversi timestamp ISO ke format 'dd/mm/yyyy HH.MM' WIB."""
     if not raw_dt:
         return "-"
     try:
@@ -124,7 +529,6 @@ def format_tgl_update(raw_dt) -> str:
 
 
 def extract_jatuh_tempo_date_wib(raw_swp) -> datetime.date:
-    """Mengambil tanggal kalender Jatuh Tempo dalam zona WIB."""
     if not raw_swp:
         return None
     try:
@@ -139,14 +543,12 @@ def extract_jatuh_tempo_date_wib(raw_swp) -> datetime.date:
 
 
 def extract_petugas(src: dict) -> str:
-    """Mengekstrak nama petugas update sesuai mapping Kibana (currentLocation.full_name)."""
     if not isinstance(src, dict):
         return "-"
-
     curr_loc = src.get("currentLocation") or {}
     custom = src.get("custom_field") or {}
-    connote = src.get("connote") or {}
     pod = src.get("pod") or {}
+    connote = src.get("connote") or {}
 
     petugas = curr_loc.get("full_name")
     if petugas and str(petugas).strip() and str(petugas).strip() not in ["__missing__", "-"]:
@@ -154,129 +556,104 @@ def extract_petugas(src: dict) -> str:
 
     petugas = (
         curr_loc.get("user_name")
-        or curr_loc.get("actor_name")
-        or curr_loc.get("actor")
         or custom.get("first_attempt_courier_name")
         or custom.get("courier_name")
         or custom.get("updated_by_name")
         or pod.get("courier_name")
         or connote.get("user_name")
     )
-    if petugas and str(petugas).strip() and str(petugas).strip() not in ["__missing__", "-"]:
-        return str(petugas).strip()
-
-    hist_tracking = custom.get("history_tracking")
-    if isinstance(hist_tracking, list):
-        for item in reversed(hist_tracking):
-            if isinstance(item, dict):
-                p = item.get("user_name") or item.get("actor_name") or item.get("actor")
-                if p and str(p).strip():
-                    return str(p).strip()
-
-    return "-"
+    return str(petugas).strip() if petugas else "-"
 
 
-@st.cache_data(ttl=120)
-def fetch_monitoring_data(kc_code: str, target_date: datetime.date) -> pd.DataFrame:
-    """Mengambil dan memfilter data kiriman jatuh tempo."""
-    start_date = target_date - datetime.timedelta(days=6)
-    payload = build_payload(kc_code, start_date, target_date)
+def extract_coordinate_gmaps(src: dict) -> tuple:
+    if not isinstance(src, dict):
+        return ("-", "")
+    pod = src.get("pod") or {}
+    coord = pod.get("coordinate") or {}
+    lat, lon = None, None
 
-    try:
-        resp = requests.post(
-            URL,
-            headers=HEADERS,
-            auth=AUTH,
-            json=payload,
-            verify=False,
-            timeout=45,
-        )
-    except Exception as e:
-        st.error(f"Gagal menghubungkan ke server Elasticsearch: {e}")
-        return pd.DataFrame()
+    if isinstance(coord, dict):
+        lat = coord.get("lat") or coord.get("latitude")
+        lon = coord.get("lon") or coord.get("longitude")
+    elif isinstance(coord, str) and "," in coord:
+        parts = coord.split(",")
+        lat, lon = parts[0].strip(), parts[1].strip()
 
-    if resp.status_code != 200:
-        st.error(f"Gagal mengambil data dari server (HTTP {resp.status_code}): {resp.text[:300]}")
-        return pd.DataFrame()
+    if lat is not None and lon is not None:
+        gmaps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+        coord_text = f"{lat:.5f}, {lon:.5f}" if isinstance(lat, float) else f"{lat}, {lon}"
+        return (coord_text, gmaps_link)
+    return ("-", "")
 
-    hits = resp.json().get("hits", {}).get("hits", [])
-    if not hits:
-        return pd.DataFrame()
+def extract_all_photos(src: dict) -> tuple:
+    """
+    Ekstraksi foto yang lebih cerdas: Mengumpulkan semua URL foto dari seluruh field 
+    (termasuk photo3, photo_ktp, dll), membuang ttd/signature, dan memastikan 
+    foto 1 (orang) dan foto 2 (KTP/KK) tidak duplikat jika ada foto lain yang tersedia.
+    """
+    if not isinstance(src, dict):
+        return ("", "")
+    
+    pod = src.get("pod") or {}
+    custom = src.get("custom_field") or {}
+    connote = src.get("connote") or {}
 
-    rows = []
-    for h in hits:
-        src = h.get("_source") or {}
-        connote = src.get("connote") or {}
-        custom = src.get("custom_field") or {}
-        curr_loc = src.get("currentLocation") or {}
+    kandidat = []
+    
+    def cari_url(obj):
+        if isinstance(obj, str):
+            obj_l = obj.lower()
+            if ("http" in obj or "apistorage" in obj) and any(e in obj_l for e in [".jpg", ".jpeg", ".png"]):
+                if "signature" not in obj_l and "ttd" not in obj_l:
+                    url_clean = obj.strip()
+                    if url_clean not in kandidat:
+                        kandidat.append(url_clean)
+        elif isinstance(obj, dict):
+            for v in obj.values(): cari_url(v)
+        elif isinstance(obj, list):
+            for v in obj: cari_url(v)
 
-        loc_name = curr_loc.get("name") or "-"
-        loc_code = str(curr_loc.get("code") or curr_loc.get("location_id") or "")
+    # Ambil secara terstruktur dari field umum terlebih dahulu
+    f_1 = pod.get("photo") or pod.get("photo1") or ""
+    f_2 = pod.get("photo2") or pod.get("photo_ktp") or ""
+    f_3 = pod.get("photo3") or pod.get("photo_identitas") or ""
 
-        is_dalam_kendali = loc_code.startswith("692") or ("692" in loc_name)
-        status_kendali = "Dalam Kendali" if is_dalam_kendali else "Di Luar Kendali"
+    # Kumpulkan semua kandidat URL dari seluruh root object
+    cari_url(pod)
+    cari_url(custom)
+    cari_url(connote)
 
-        raw_swp = custom.get("final_swp_date_new")
-        jt_date = extract_jatuh_tempo_date_wib(raw_swp)
+    # Filter kandidat yang bersih dari signature
+    kandidat_bersih = [u for u in kandidat if "signature" not in u.lower() and "ttd" not in u.lower()]
 
-        # 1. Paket 6 hari lalu hanya diambil jika dalam kendali
-        if jt_date and jt_date < target_date:
-            if not is_dalam_kendali:
-                continue
+    foto_orang = ""
+    foto_ktp = ""
 
-        # 2. Aturan Retur Barang: hanya jika dalam kendali (692xx)
-        irreg_reason = str(custom.get("irregularityReason") or custom.get("irregularity_reason") or "").lower()
-        irreg_status = str(custom.get("irregularityStatus") or custom.get("irregularity_status") or "").lower()
-        connote_state = str(connote.get("connote_state") or "").lower()
+    # Tentukan Foto 1 (Prioritaskan foto pertama atau foto ke-3 jika ada)
+    if f_1 and f_1 in kandidat_bersih:
+        foto_orang = f_1
+    elif len(kandidat_bersih) > 0:
+        foto_orang = kandidat_bersih[0]
 
-        is_retur_barang = ("retur" in irreg_reason) or ("retur" in irreg_status) or ("return" in connote_state)
-        if is_retur_barang and not is_dalam_kendali:
-            continue
+    # Tentukan Foto 2 (Cari foto lain yang TIDAK SAMA dengan foto_orang)
+    if f_3 and f_3 != foto_orang and f_3 in kandidat_bersih:
+        foto_ktp = f_3
+    elif f_2 and f_2 != foto_orang and f_2 in kandidat_bersih:
+        foto_ktp = f_2
+    else:
+        # Cari foto lain dalam list yang berbeda dari foto_orang
+        for u in kandidat_bersih:
+            if u != foto_orang:
+                foto_ktp = u
+                break
 
-        # Penentuan Status SLA
-        over_sla_flag = custom.get("over_sla")
-        sla_state = str(custom.get("sla_state") or "").lower()
+    # Fallback terakhir jika benar-benar hanya ada 1 foto di sistem
+    if not foto_ktp and foto_orang:
+        foto_ktp = foto_orang
 
-        if jt_date and jt_date < target_date:
-            status_sla = "Over SLA"
-        elif over_sla_flag == 1 or over_sla_flag == "1" or "over" in sla_state:
-            status_sla = "Over SLA"
-        else:
-            status_sla = "Jatuh Tempo"
-
-        connote_code = str(connote.get("connote_code") or src.get("connote_code") or h.get("_id")).strip()
-        petugas_name = extract_petugas(src)
-        raw_updated = connote.get("updated_at") or src.get("updated_at")
-        tgl_update = format_tgl_update(raw_updated)
-
-        tgl_jt_label = jt_date.strftime("%d/%m/%Y") if jt_date else "-"
-        kategori_hari = "Hari Ini" if jt_date == target_date else "6 Hari Lalu"
-
-        rows.append({
-            "connote": connote_code,
-            "url_lacak": generate_pid_url(connote_code),
-            "KC/KCP": loc_name,
-            "Tgl Jatuh Tempo": tgl_jt_label,
-            "Periode": kategori_hari,
-            "Status SLA": status_sla,
-            "Tgl Update": tgl_update,
-            "Petugas Update": petugas_name,
-            "Status": connote.get("connote_state") or "-",
-            "Layanan": connote.get("connote_service") or "-",
-            "Penerima": connote.get("connote_receiver_name") or "-",
-            "Alamat": connote.get("connote_receiver_address") or "-",
-            "First Attempt": custom.get("first_attempt_time") or "-",
-            "Alasan Gagal Antar": custom.get("reason_failedtodelivered") or "-",
-            "Irregularity": custom.get("irregularityReason") or "-",
-            "Kendali": status_kendali,
-        })
-
-    df = pd.DataFrame(rows)
-    return df
-
+    return (foto_orang, foto_ktp)
 
 def render_metric_card(title: str, value: int, badge_text: str = "", badge_bg: str = "#e2e8f0", badge_color: str = "#334155", card_border: str = "#e2e8f0", icon_char: str = ""):
-    """Merender kartu indikator modern dengan angka ukuran besar."""
     badge_html = f'<div style="display: inline-block; background-color: {badge_bg}; color: {badge_color}; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 999px; margin-top: 6px;">{badge_text}</div>' if badge_text else ''
     card_html = f"""
     <div style="background-color: #ffffff; border-radius: 12px; border: 1px solid {card_border}; padding: 16px 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.04); height: 100%; display: flex; flex-direction: column; justify-content: space-between;">
@@ -287,333 +664,560 @@ def render_metric_card(title: str, value: int, badge_text: str = "", badge_bg: s
         <div style="font-size: 38px; font-weight: 900; color: #0f172a; line-height: 1.1; margin: 4px 0 2px 0; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif;">
             {value}
         </div>
-        <div>
-            {badge_html}
-        </div>
+        <div>{badge_html}</div>
     </div>
     """
     st.markdown(card_html, unsafe_allow_html=True)
 
 
-def render_screenshot_card(courier_name: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
-    """Merender tabel HTML siap screenshot per pengantar rapat tanpa indentasi."""
-    rows_list = []
-    for _, row in group_df.iterrows():
-        r_connote = str(row['connote'])
-        r_url = str(row['url_lacak'])
-        r_loc = str(row['KC/KCP'])
-        r_tgl = str(row['Tgl Update'])
-        r_petugas = str(row['Petugas Update'])
-        r_status = str(row['Status'])
-        r_layanan = str(row['Layanan'])
-        r_sla = str(row['Status SLA'])
-        r_penerima = str(row['Penerima'])
-        r_alamat = str(row['Alamat'])
-
-        sla_color = "#b30000" if r_sla == "Over SLA" else "#d97706"
-        connote_display = f'<a href="{r_url}" target="_blank" style="color: #002060; text-decoration: underline; font-weight: bold;">{r_connote}</a>' if r_url else r_connote
-
-        row_html = (
-            f'<tr style="border-bottom: 1px solid #ddd; background-color: #ffffff; color: #111111; font-size: 13px;">'
-            f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{connote_display}</td>'
-            f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{r_loc}</td>'
-            f'<td style="padding: 7px 10px; text-align: center; border-right: 1px solid #eee;">{r_tgl}</td>'
-            f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{r_petugas}</td>'
-            f'<td style="padding: 7px 10px; text-align: center; border-right: 1px solid #eee; font-weight: 600;">{r_status}</td>'
-            f'<td style="padding: 7px 10px; text-align: center; border-right: 1px solid #eee; font-weight: bold; color: {header_bg};">{r_layanan}</td>'
-            f'<td style="padding: 7px 10px; text-align: center; border-right: 1px solid #eee; font-weight: 700; color: {sla_color};">{r_sla}</td>'
-            f'<td style="padding: 7px 10px; border-right: 1px solid #eee;">{r_penerima}</td>'
-            f'<td style="padding: 7px 10px;">{r_alamat}</td>'
-            f'</tr>'
-        )
-        rows_list.append(row_html)
-
-    tbody_content = "".join(rows_list)
-
-    full_card_html = (
-        f'<div style="margin-bottom: 25px; border-radius: 4px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.15); border: 1px solid #bbb;">'
-        f'<div style="background-color: #ffffff; color: #000000; text-align: center; padding: 7px; font-size: 18px; font-weight: 900; letter-spacing: 0.5px; border-bottom: 2px solid #111;">'
-        f'{courier_name}'
-        f'</div>'
-        f'<table style="width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;">'
-        f'<thead>'
-        f'<tr style="background-color: {header_bg}; color: #ffffff; font-size: 13px; text-align: center;">'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Nomor Resi</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Posisi Saat ini</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Tgl Update</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Petugas Update</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Status</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Produk</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Over SLA / Jatuh Tempo</th>'
-        f'<th style="padding: 8px 10px; border-right: 1px solid rgba(255,255,255,0.2);">Nama Penerima</th>'
-        f'<th style="padding: 8px 10px;">Alamat Penerima</th>'
-        f'</tr>'
-        f'</thead>'
-        f'<tbody>{tbody_content}</tbody>'
-        f'</table>'
-        f'</div>'
-    )
-
-    st.markdown(full_card_html, unsafe_allow_html=True)
-
-
-# --- SIDEBAR: FILTER PARAMETER ---
-st.sidebar.header("⚙️ Filter Parameter")
-
-today = datetime.date.today()
-tgl_hari_ini = st.sidebar.date_input("Tanggal Jatuh Tempo (Hari Ini)", today)
-kc_input = st.sidebar.text_input("KC Tujuan", value="69200")
-
-tgl_h6 = tgl_hari_ini - datetime.timedelta(days=6)
-
-st.sidebar.markdown(
-    f"""
-    <div style="background-color: #f8fafc; border-left: 3px solid #0284c7; border-radius: 6px; padding: 10px; font-size: 12px; margin-top: 10px; color: #334155;">
-        <div style="font-weight: 700; margin-bottom: 4px; color: #0369a1;">📌 Periode Pemantauan:</div>
-        <div><b>{tgl_h6.strftime('%d/%m/%Y')}</b> s.d. <b>{tgl_hari_ini.strftime('%d/%m/%Y')}</b></div>
-        <div style="margin-top: 6px; font-weight: 700; color: #0369a1;">⚙️ Lingkup Data:</div>
-        <div style="line-height: 1.4;">• <b>Hari Ini:</b> Dalam & Luar Kendali</div>
-        <div style="line-height: 1.4;">• <b>6 Hari Lalu:</b> Khusus Dalam Kendali (692xx)</div>
-        <div style="line-height: 1.4;">• <b>Retur Barang:</b> Hanya jika masih di 692xx</div>
-    </div>
-    """,
-    unsafe_allow_html=True
+# ========================================================
+# NAVIGASI MENU SIDEBAR
+# ========================================================
+st.sidebar.title("🎛️ Navigasi Menu")
+menu_pilihan = st.sidebar.radio(
+    "Pilih Dashboard:",
+    ["📦 Monitoring Jatuh Tempo", "⚖️ Uji Petik Mahkamah Agung (PA/PN)"],
+    index=1
 )
-
-st.sidebar.markdown("<br>", unsafe_allow_html=True)
-if st.sidebar.button("🔄 Refresh Data"):
-    st.cache_data.clear()
-    st.rerun()
-
-# --- AMBIL DATA ---
-with st.spinner(f"Memuat data jatuh tempo ({tgl_h6.strftime('%d/%m/%Y')} s.d. {tgl_hari_ini.strftime('%d/%m/%Y')})..."):
-    df_raw = fetch_monitoring_data(kc_input, tgl_hari_ini)
-
-# --- HEADER DASHBOARD ---
-st.title("📦 Monitoring Kiriman Jatuh Tempo")
-st.caption(f"Wilayah KC: **{kc_input}** | Acuan Hari Ini: **{tgl_hari_ini.strftime('%d/%m/%Y')}** (Plus 6 Hari Sebelumnya Dalam Kendali)")
-
-if df_raw.empty:
-    st.warning(f"Tidak ada kiriman jatuh tempo untuk KC {kc_input} pada periode ini.")
-    st.stop()
-
-# --- FILTER TAMBAHAN (SIDEBAR) ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("Filter Tampilan")
 
-list_sla = df_raw["Status SLA"].unique().tolist()
-sel_sla = st.sidebar.multiselect("Status SLA", options=list_sla, default=list_sla)
 
-list_periode = df_raw["Periode"].unique().tolist()
-sel_periode = st.sidebar.multiselect("Periode", options=list_periode, default=list_periode)
+# ==============================================================================
+# MENU 1: MONITORING JATUH TEMPO
+# ==============================================================================
+if menu_pilihan == "📦 Monitoring Jatuh Tempo":
+    st.title("📦 Monitoring Kiriman Jatuh Tempo")
 
-list_kendali = df_raw["Kendali"].unique().tolist()
-sel_kendali = st.sidebar.multiselect("Area Kendali", options=list_kendali, default=list_kendali)
+    today = datetime.date.today()
+    tgl_hari_ini = st.sidebar.date_input("Tanggal Jatuh Tempo (Hari Ini)", today)
+    kc_input = st.sidebar.text_input("KC Tujuan", value="69200")
+    tgl_h6 = tgl_hari_ini - datetime.timedelta(days=6)
 
-list_layanan = df_raw["Layanan"].dropna().unique().tolist()
-sel_layanan = st.sidebar.multiselect("Layanan", options=list_layanan, default=list_layanan)
-
-list_status = df_raw["Status"].dropna().unique().tolist()
-sel_status = st.sidebar.multiselect("Status Terakhir", options=list_status, default=list_status)
-
-df_filtered = df_raw[
-    (df_raw["Status SLA"].isin(sel_sla)) &
-    (df_raw["Periode"].isin(sel_periode)) &
-    (df_raw["Kendali"].isin(sel_kendali)) &
-    (df_raw["Layanan"].isin(sel_layanan)) &
-    (df_raw["Status"].isin(sel_status))
-].copy()
-
-# --- HITUNG METRICS ---
-total_item = len(df_filtered)
-total_oversla = len(df_filtered[df_filtered["Status SLA"] == "Over SLA"])
-total_jatuhtempo = len(df_filtered[df_filtered["Status SLA"] == "Jatuh Tempo"])
-total_dalam = len(df_filtered[df_filtered["Kendali"] == "Dalam Kendali"])
-total_luar = len(df_filtered[df_filtered["Kendali"] == "Di Luar Kendali"])
-
-# --- 5 KARTU METRIK KPI ---
-c1, c2, c3, c4, c5 = st.columns(5)
-
-with c1:
-    render_metric_card(
-        title="Total Resi Terpantau",
-        value=total_item,
-        badge_text="Periode H s.d. H-6",
-        badge_bg="#e2e8f0",
-        badge_color="#334155",
-        card_border="#cbd5e1",
-        icon_char="📦"
+    st.sidebar.markdown(
+        f"""
+        <div style="background-color: #f8fafc; border-left: 3px solid #0284c7; border-radius: 6px; padding: 10px; font-size: 12px; margin-top: 10px; color: #334155;">
+            <div style="font-weight: 700; margin-bottom: 4px; color: #0369a1;">📌 Periode Pemantauan:</div>
+            <div><b>{tgl_h6.strftime('%d/%m/%Y')}</b> s.d. <b>{tgl_hari_ini.strftime('%d/%m/%Y')}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-with c2:
-    render_metric_card(
-        title="Over SLA",
-        value=total_oversla,
-        badge_text=f"↑ {total_oversla} lewat deadline",
-        badge_bg="#fee2e2",
-        badge_color="#b91c1c",
-        card_border="#fca5a5",
-        icon_char="🚨"
+    if st.sidebar.button("🔄 Refresh Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    def build_payload_jt(kc_code: str, start_date: datetime.date, end_date: datetime.date) -> dict:
+        prev_start = start_date - datetime.timedelta(days=1)
+        gte_utc = f"{prev_start.strftime('%Y-%m-%d')}T17:00:00.000Z"
+        lte_utc = f"{end_date.strftime('%Y-%m-%d')}T16:59:59.999Z"
+
+        return {
+            "size": 5000,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {
+                            "bool": {
+                                "minimum_should_match": 1,
+                                "should": [
+                                    {"match_phrase": {"connote.connote_service.keyword": "Q9"}},
+                                    {"match_phrase": {"connote.connote_service.keyword": "PE"}},
+                                    {"match_phrase": {"connote.connote_service.keyword": "PKH"}},
+                                    {"match_phrase": {"connote.connote_service.keyword": "EC3"}},
+                                ],
+                            }
+                        },
+                        {"match_phrase": {"custom_field.destination_kprk.keyword": {"query": str(kc_code)}}},
+                        {"range": {"custom_field.final_swp_date_new": {"format": "strict_date_optional_time", "gte": gte_utc, "lte": lte_utc}}},
+                    ],
+                    "must_not": [
+                        {"bool": {"should": [{"match_phrase": {"connote.connote_state.keyword": "DELIVERED"}}, {"match_phrase": {"connote.connote_state.keyword": "DELIVERED (RETURN DELIVERY)"}}], "minimum_should_match": 1}},
+                        {"bool": {"should": [{"match_phrase": {"connote.connote_state.keyword": "CANCEL"}}, {"match_phrase": {"connote.connote_state.keyword": "PENDING"}}], "minimum_should_match": 1}},
+                        {"match_phrase": {"connote.location_name.keyword": {"query": "AGP TESTING LOCATION"}}},
+                        {"match_phrase": {"connote.connote_service.keyword": {"query": "LNINCOMING"}}},
+                    ],
+                }
+            },
+        }
+
+    @st.cache_data(ttl=120)
+    def fetch_data_jt(kc_code: str, target_date: datetime.date) -> pd.DataFrame:
+        start_date = target_date - datetime.timedelta(days=6)
+        payload = build_payload_jt(kc_code, start_date, target_date)
+        try:
+            resp = requests.post(URL_ES, headers=HEADERS_ES, auth=AUTH_ES, json=payload, verify=False, timeout=35)
+        except Exception as e:
+            st.error(f"Gagal koneksi ES: {e}")
+            return pd.DataFrame()
+
+        hits = resp.json().get("hits", {}).get("hits", []) if resp.status_code == 200 else []
+        rows = []
+        for h in hits:
+            src = h.get("_source", {})
+            connote = src.get("connote", {})
+            custom = src.get("custom_field", {})
+            curr_loc = src.get("currentLocation", {})
+
+            loc_name = curr_loc.get("name") or "-"
+            loc_code = str(curr_loc.get("code") or "")
+            is_dalam = loc_code.startswith("692") or ("692" in loc_name)
+
+            raw_swp = custom.get("final_swp_date_new")
+            jt_date = extract_jatuh_tempo_date_wib(raw_swp)
+
+            if jt_date and jt_date < target_date and not is_dalam:
+                continue
+
+            c_code = str(connote.get("connote_code") or h.get("_id")).strip()
+            rows.append({
+                "connote": c_code,
+                "url_lacak": generate_pid_url(c_code),
+                "kantor update": loc_name,
+                "Tgl Update": format_tgl_update(connote.get("updated_at") or src.get("updated_at")),
+                "Petugas Update": extract_petugas(src),
+                "Status": connote.get("connote_state") or "-",
+                "Layanan": connote.get("connote_service") or "-",
+                "Status SLA": "Over SLA" if (jt_date and jt_date < target_date) else "Jatuh Tempo",
+                "Penerima": connote.get("connote_receiver_name") or "-",
+                "Alamat": connote.get("connote_receiver_address") or "-",
+                "Kendali": "Dalam Kendali" if is_dalam else "Di Luar Kendali",
+            })
+        return pd.DataFrame(rows)
+
+    with st.spinner("Memuat data jatuh tempo..."):
+        df_jt = fetch_data_jt(kc_input, tgl_hari_ini)
+
+    st.caption(f"Wilayah KC: **{kc_input}** | Periode: **{tgl_h6.strftime('%d/%m/%Y')}** s.d. **{tgl_hari_ini.strftime('%d/%m/%Y')}**")
+
+    if df_jt.empty:
+        st.warning("Tidak ada kiriman jatuh tempo pada periode ini.")
+        st.stop()
+
+    t_item = len(df_jt)
+    t_over = len(df_jt[df_jt["Status SLA"] == "Over SLA"])
+    t_jt_today = len(df_jt[df_jt["Status SLA"] == "Jatuh Tempo"])
+    t_dalam = len(df_jt[df_jt["Kendali"] == "Dalam Kendali"])
+    t_luar = len(df_jt[df_jt["Kendali"] == "Di Luar Kendali"])
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: render_metric_card("Total Resi Terpantau", t_item, "Periode H s.d. H-6", "#e2e8f0", "#334155", "#cbd5e1", "📦")
+    with c2: render_metric_card("Over SLA", t_over, f"↑ {t_over} lewat deadline", "#fee2e2", "#b91c1c", "#fca5a5", "🚨")
+    with c3: render_metric_card("Jatuh Tempo Hari Ini", t_jt_today, f"↑ {t_jt_today} deadline hari ini", "#fef3c7", "#b45309", "#fcd34d", "⏳")
+    with c4: render_metric_card("Dalam Kendali (692xx)", t_dalam, "Di UPT KC/KCP", "#dcfce7", "#15803d", "#86efac", "🟢")
+    with c5: render_metric_card("Di Luar Kendali", t_luar, "Luar Wilayah", "#f1f5f9", "#475569", "#cbd5e1", "🔴")
+
+    st.markdown("---")
+    st.subheader("📸 Format Tabel per Petugas Pengantar (Siap Screenshot)")
+
+    couriers = [p for p in df_jt["Petugas Update"].dropna().unique() if p != "-"]
+    colors = ["#002060", "#c00000"]
+
+    for idx, courier in enumerate(couriers):
+        df_sub = df_jt[df_jt["Petugas Update"] == courier]
+        tbody_rows = []
+        for _, r in df_sub.iterrows():
+            sla_c = "#b30000" if r['Status SLA'] == "Over SLA" else "#d97706"
+            tbody_rows.append(
+                f"<tr style='border-bottom: 1px solid #ddd; font-size: 13px;'>"
+                f"<td style='padding: 8px 10px;'><a href='{r['url_lacak']}' target='_blank' style='color:#002060; font-weight:bold; text-decoration:underline;'>{r['connote']}</a></td>"
+                f"<td style='padding: 8px 10px;'>{r['kantor update']}</td>"
+                f"<td style='padding: 8px 10px; text-align:center;'>{r['Tgl Update']}</td>"
+                f"<td style='padding: 8px 10px;'>{r['Petugas Update']}</td>"
+                f"<td style='padding: 8px 10px; text-align:center; font-weight:600;'>{r['Status']}</td>"
+                f"<td style='padding: 8px 10px; text-align:center; font-weight:bold;'>{r['Layanan']}</td>"
+                f"<td style='padding: 8px 10px; text-align:center; font-weight:bold; color:{sla_c};'>{r['Status SLA']}</td>"
+                f"<td style='padding: 8px 10px;'>{r['Penerima']}</td>"
+                f"<td style='padding: 8px 10px;'>{r['Alamat']}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"<div style='margin-bottom: 25px; border-radius: 6px; overflow: hidden; border: 1px solid #94a3b8; box-shadow: 0 1px 4px rgba(0,0,0,0.1);'>"
+            f"<div style='background-color: #ffffff; text-align: center; padding: 8px; font-size: 17px; font-weight: 900; border-bottom: 2px solid #111;'>{courier}</div>"
+            f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
+            f"<thead><tr style='background-color: {colors[idx % 2]}; color: #ffffff; font-size: 13px; text-align: center;'>"
+            f"<th style='padding: 8px;'>Nomor Resi</th><th>Kantor Update</th><th>Tgl Update</th><th>Petugas Update</th><th>Status</th><th>Produk</th><th>Status SLA</th><th>Penerima</th><th>Alamat</th>"
+            f"</tr></thead>"
+            f"<tbody>{''.join(tbody_rows)}</tbody>"
+            f"</table>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+
+# ==============================================================================
+# MENU 2: UJI PETIK MAHKAMAH AGUNG (PA / PN)
+# ==============================================================================
+elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
+    st.title("⚖️ Laporan Uji Petik Kiriman MA (PA/PN) KC Sampang")
+    st.caption("Monitoring Kiriman Surat Tercatat MA (LNMAPAG05692A & LNMAPN05692A)")
+
+    today = datetime.date.today()
+    # Default: 2 hari ke belakang (Misal hari ini tgl 8, maka default tgl 6 s.d. tgl 6)
+    default_tgl = today - datetime.timedelta(days=2)
+    
+    d_start = st.sidebar.date_input("Dari Tanggal", default_tgl)
+    d_end = st.sidebar.date_input("Sampai Tanggal", default_tgl)
+
+    # Filter Status Kiriman
+    filter_status = st.sidebar.radio(
+        "Filter Status Kiriman:",
+        ["Semua Status", "⚠️ Hanya INVALID (Perlu Cek)", "✅ Hanya VALID"],
+        index=0
     )
 
-with c3:
-    render_metric_card(
-        title="Jatuh Tempo Hari Ini",
-        value=total_jatuhtempo,
-        badge_text=f"↑ {total_jatuhtempo} deadline hari ini",
-        badge_bg="#fef3c7",
-        badge_color="#b45309",
-        card_border="#fcd34d",
-        icon_char="⏳"
+    if st.sidebar.button("🔄 Refresh Data MA"):
+        st.cache_data.clear()
+        if "audit_data" in st.session_state:
+            del st.session_state["audit_data"]
+        if "manual_overrides" in st.session_state:
+            del st.session_state["manual_overrides"]
+        st.rerun()
+    def build_payload_ma(start_date: datetime.date, end_date: datetime.date) -> dict:
+        gte_utc = f"{start_date.strftime('%Y-%m-%d')}T00:00:00.000Z"
+        lte_utc = f"{end_date.strftime('%Y-%m-%d')}T23:59:59.999Z"
+
+        return {
+            "size": 2000,
+            "_source": {"excludes": ["pod.reason_onprocess*"]},
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"match_phrase": {"connote.connote_state.keyword": "DELIVERED"}},
+                        {"match_phrase": {"custom_field.destination_reg_new.keyword": "5"}},
+                        {"match_phrase": {"custom_field.destination_kprk.keyword": "69200"}},
+                        {
+                            "bool": {
+                                "should": [
+                                    {"match_phrase": {"customer_code.keyword": "LNMAPAG05692A"}},
+                                    {"match_phrase": {"customer_code.keyword": "LNMAPN05692A"}},
+                                ],
+                                "minimum_should_match": 1,
+                            }
+                        },
+                        # Gunakan field root 'created_at' untuk tanggal pembuatan resi
+                        {"range": {"created_at": {"format": "strict_date_optional_time", "gte": gte_utc, "lte": lte_utc}}},
+                    ],
+                    "must_not": [
+                        {"match_phrase": {"connote.connote_service.keyword": "LNINCOMING"}},
+                        {"bool": {"should": [{"match_phrase": {"connote.connote_state.keyword": "CANCEL"}}, {"match_phrase": {"connote.connote_state.keyword": "PENDING"}}], "minimum_should_match": 1}},
+                        {"match_phrase": {"location_data_created.location_name.keyword": "AGP TESTING LOCATION"}},
+                    ],
+                }
+            },
+        }
+
+    # Cache 10 menit agar interaksi UI dan koreksi manual berjalan mulus
+    @st.cache_data(ttl=600)
+    def fetch_data_ma(start_date: datetime.date, end_date: datetime.date) -> pd.DataFrame:
+        payload = build_payload_ma(start_date, end_date)
+        try:
+            resp = requests.post(URL_ES, headers=HEADERS_ES, auth=AUTH_ES, json=payload, verify=False, timeout=20)
+            if resp.status_code != 200:
+                st.error(f"Error dari server Elasticsearch ({resp.status_code}): {resp.text[:100]}")
+                return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Gagal koneksi ES: {e}")
+            return pd.DataFrame()
+        
+        hits = resp.json().get("hits", {}).get("hits", [])
+        # ... sisa kode pemrosesan data ...
+        rows = []
+        for h in hits:
+            src = h.get("_source", {})
+            connote = src.get("connote", {})
+            curr_loc = src.get("currentLocation", {})
+            pod = src.get("pod", {})
+
+            teks_all = " ".join([
+                str(connote.get("connote_receiver_name") or ""),
+                str(connote.get("connote_receiver_address") or ""),
+                str(pod.get("receiver_name") or ""),
+            ]).upper()
+            if any(k in teks_all for k in ["JAKSA", "KEJARI", "TAHANAN", "RUTAN", "PERTANAHAN", "BPN", "AGRARIA"]):
+                continue
+
+            c_code = str(connote.get("connote_code") or h.get("_id")).strip()
+            loc_name = curr_loc.get("name") or "-"
+            petugas = extract_petugas(src)
+            c_txt, m_url = extract_coordinate_gmaps(src)
+            f_orang, f_ktp = extract_all_photos(src)
+
+            # Evaluasi gambar ter-cache per resi
+            stat_inv, ket_inv = evaluate_connote_photos_cached(c_code, f_orang, f_ktp)
+
+            state = connote.get("connote_state") or "-"
+            rec = pod.get("receiver_name") or connote.get("connote_receiver_name") or ""
+            rel = pod.get("relation") or ""
+            status_kiriman = f"{state} oleh {rec}" + (f" ({rel})" if rel else "")
+
+            rows.append({
+                "connote": c_code,
+                "url_lacak": generate_pid_url(c_code),
+                "kantor update": loc_name,
+                "status kiriman": status_kiriman,
+                "petugas update": petugas,
+                "nama penerima": connote.get("connote_receiver_name") or "-",
+                "alamat penerima": connote.get("connote_receiver_address") or "-",
+                "koordinat": c_txt,
+                "url_maps": m_url,
+                "foto_orang": f_orang,
+                "foto_ktp": f_ktp,
+                "Hasil Investigasi": stat_inv,
+                "Penjelasan Invalid": ket_inv,
+            })
+        return pd.DataFrame(rows)
+
+    with st.spinner("Memuat data uji petik MA & menganalisis bukti foto..."):
+        df_raw_ma = fetch_data_ma(d_start, d_end)
+
+    if df_raw_ma.empty:
+        st.warning(f"Belum ditemukan kiriman MA untuk rentang {d_start.strftime('%d/%m/%Y')} s.d. {d_end.strftime('%d/%m/%Y')}.")
+        st.stop()
+
+    if "manual_overrides" not in st.session_state:
+        st.session_state["manual_overrides"] = {}
+
+    if "audit_data" not in st.session_state:
+        df_init = df_raw_ma.copy()
+
+        # Penggabungan (Mapping) Data Petugas Rudy ke Iqbal
+        df_init["pengantar_label"] = df_init.apply(lambda r: f"{r['petugas update']} ( {r['kantor update']} )", axis=1)
+        target_nama_gabung = "Moh Iqbal Syahputra ( KCP KETAPANG SAMPANG 69261 )"
+        mask_rudy = df_init["pengantar_label"].str.contains("Rudy Ermawanto", case=False, na=False) & \
+                    df_init["pengantar_label"].str.contains("69261", case=False, na=False)
+        df_init.loc[mask_rudy, "pengantar_label"] = target_nama_gabung
+        df_init.loc[mask_rudy, "petugas update"] = "Moh Iqbal Syahputra"
+
+        for connote_key, val in st.session_state["manual_overrides"].items():
+            matched = df_init[df_init["connote"] == connote_key].index
+            if len(matched) > 0:
+                df_init.loc[matched, "Hasil Investigasi"] = val["status"]
+                df_init.loc[matched, "Penjelasan Invalid"] = val["ket"]
+        st.session_state["audit_data"] = df_init
+
+    df_ma = st.session_state["audit_data"]
+
+    # --- KPI METRIK KESELURUHAN (TIDAK TERPENGARUH FILTER TAMPILAN) ---
+    total_ma = len(df_ma)
+    total_valid = len(df_ma[df_ma["Hasil Investigasi"] == "VALID"])
+    total_invalid = len(df_ma[df_ma["Hasil Investigasi"] == "INVALID"])
+    pct_v = round((total_valid / total_ma * 100), 1) if total_ma > 0 else 0
+    pct_i = round((total_invalid / total_ma * 100), 1) if total_ma > 0 else 0
+
+    m1, m2, m3 = st.columns(3)
+    with m1: render_metric_card("Total Resi", total_ma, f"Periode {d_start.strftime('%d/%m')} - {d_end.strftime('%d/%m/%Y')}", "#e2e8f0", "#334155", "#cbd5e1", "📦")
+    with m2: render_metric_card("✅ Antaran Valid", total_valid, f"↑ {pct_v}% Kepatuhan", "#dcfce7", "#15803d", "#86efac", "✅")
+    with m3: render_metric_card("⚠️ Antaran Invalid", total_invalid, f"↑ {pct_i}% Perlu Pembinaan", "#fee2e2", "#b91c1c", "#fca5a5", "⚠️")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader("📊 Persentase Kepatuhan Antaran per Petugas")
+
+    summary_rows = []
+    for p_name, group in df_ma.groupby("pengantar_label"):
+        t_p = int(len(group))
+        v_p = int(len(group[group["Hasil Investigasi"] == "VALID"]))
+        i_p = int(len(group[group["Hasil Investigasi"] == "INVALID"]))
+        m = re.search(r'\b(\d{5})\b', str(group["kantor update"].iloc[0]))
+        nopend_num = int(m.group(1)) if m else 99999
+
+        summary_rows.append({
+            "Petugas & Kantor": p_name,
+            "nopend": nopend_num,
+            "Total Kiriman": t_p,
+            "Valid": v_p,
+            "Invalid": i_p,
+            "% Valid": f"{round(v_p / t_p * 100, 1)}%",
+            "% Invalid": f"{round(i_p / t_p * 100, 1)}%",
+            "val_num": round(v_p / t_p * 100, 1),
+        })
+
+    # Sort mutlak berdasarkan Invalid terbanyak
+    df_summary = pd.DataFrame(summary_rows).sort_values(
+        by=["Invalid", "Total Kiriman"],
+        ascending=[False, False]
+    ).reset_index(drop=True)
+
+    summary_tr = []
+    for _, r in df_summary.iterrows():
+        b_color = "#16a34a" if r["val_num"] >= 90 else ("#d97706" if r["val_num"] >= 70 else "#dc2626")
+        # Beri warna background merah muda jika ada invalid
+        bg_row = "#fef2f2" if r["val_num"] < 100.0 else "#ffffff"
+
+        summary_tr.append(
+            f"<tr style='border-bottom: 1px solid #fecaca; background-color: {bg_row}; font-size: 13px;'>"
+            f"<td style='padding: 8px 12px; font-weight: 700;'>{r['Petugas & Kantor']}</td>"
+            f"<td style='padding: 8px; text-align: center; font-weight: 600;'>{r['Total Kiriman']}</td>"
+            f"<td style='padding: 8px; text-align: center; color: #15803d; font-weight: 700;'>{r['Valid']}</td>"
+            f"<td style='padding: 8px; text-align: center; color: #b91c1c; font-weight: 700;'>{r['Invalid']}</td>"
+            f"<td style='padding: 8px; text-align: center; font-weight: 800; color: #15803d;'>{r['% Valid']}</td>"
+            f"<td style='padding: 8px; text-align: center; font-weight: 800; color: #b91c1c;'>{r['% Invalid']}</td>"
+            f"<td style='padding: 8px; min-width: 130px;'><div style='background-color:#e2e8f0; border-radius:999px; height:8px; width:100%;'><div style='background-color:{b_color}; width:{r['val_num']}%; height:100%; border-radius:999px;'></div></div></td>"
+            f"</tr>"
+        )
+
+    st.markdown(
+        f"<div style='overflow-x: auto; border: 1px solid #cbd5e1; border-radius: 8px; margin-bottom: 25px;'>"
+        f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
+        f"<thead><tr style='background-color: #f1f5f9; color: #334155; font-size: 13px; text-align: center; border-bottom: 2px solid #cbd5e1;'>"
+        f"<th style='padding: 9px 12px; text-align: left;'>Nama Petugas (Kantor)</th><th>Total Kiriman</th><th>Valid</th><th>Invalid</th><th>% Valid</th><th>% Invalid</th><th style='text-align: left;'>Tingkat Kepatuhan</th>"
+        f"</tr></thead>"
+        f"<tbody>{''.join(summary_tr)}</tbody>"
+        f"</table>"
+        f"</div>",
+        unsafe_allow_html=True
     )
 
-with c4:
-    render_metric_card(
-        title="Dalam Kendali (692xx)",
-        value=total_dalam,
-        badge_text="Di UPT KC/KCP",
-        badge_bg="#dcfce7",
-        badge_color="#15803d",
-        card_border="#86efac",
-        icon_char="🟢"
+    st.markdown("---")
+    st.subheader("📸 Format Tabel Uji Petik per Petugas Pengantar (Siap Screenshot)")
+
+    def render_tabel_kartu_ma(header_label: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
+        table_rows = []
+        for idx, (_, row) in enumerate(group_df.iterrows(), start=1):
+            r_link = f"<a href='{row['url_lacak']}' target='_blank' style='color:#002060; font-weight:bold; text-decoration:underline;'>{row['connote']}</a>" if row['url_lacak'] else row['connote']
+            coord_link = f"<a href='{row['url_maps']}' target='_blank' style='color:#16a34a; font-weight:bold; text-decoration:underline;'>📍 {row['koordinat']}</a>" if row['url_maps'] else "-"
+            img_orang = f"<a href='{row['foto_orang']}' target='_blank'><img src='{row['foto_orang']}' style='width: 105px; height: 115px; object-fit: cover; border-radius: 6px; border: 1.5px solid #cbd5e1;'></a>" if row['foto_orang'] else "<span style='color:#94a3b8; font-size:11px;'>Tidak ada foto</span>"
+            img_ktp = f"<a href='{row['foto_ktp']}' target='_blank'><img src='{row['foto_ktp']}' style='width: 155px; height: 105px; object-fit: cover; border-radius: 6px; border: 1.5px solid #cbd5e1;'></a>" if row['foto_ktp'] else "<span style='color:#dc2626; font-size:11px; font-weight:bold;'>Tidak ada KTP/KK</span>"
+
+            is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
+            badge_inv = '<div style="background-color: #86efac; color: #065f46; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #4ade80;">VALID</div>' if is_valid else '<div style="background-color: #fca5a5; color: #991b1b; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #f87171;">INVALID</div>'
+            ket_txt = row["Penjelasan Invalid"] if str(row["Penjelasan Invalid"]).strip() else "-"
+
+            table_rows.append(
+                f"<tr style='border-bottom: 1px solid #cbd5e1; background-color: #ffffff; font-size: 13px;'>"
+                f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
+                f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
+                f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
+                f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><b>{row['nama penerima']}</b><br><span style='color: #64748b; font-size: 11px;'>{row['alamat penerima']}</span></td>"
+                f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
+                f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
+                f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_ktp}</td>"
+                f"<td style='padding: 10px 8px; text-align: center; min-width: 100px; border-right: 1px solid #e2e8f0;'>{badge_inv}</td>"
+                f"<td style='padding: 10px 10px; color: #334155; font-weight: 600; font-size: 12px; min-width: 160px;'>{ket_txt}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"<div style='margin-bottom: 12px; border-radius: 6px; overflow: hidden; box-shadow: 0 2px 6px rgba(0,0,0,0.12); border: 1px solid #94a3b8;'>"
+            f"<div style='background-color: #ffffff; color: #000000; text-align: center; padding: 10px 6px; font-size: 16px; font-weight: 900; letter-spacing: 0.5px; border-bottom: 2px solid #111;'>{header_label}</div>"
+            f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
+            f"<thead><tr style='background-color: {header_bg}; color: #ffffff; font-size: 13px; text-align: center;'>"
+            f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Penerima & Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
+            f"</tr></thead>"
+            f"<tbody>{''.join(table_rows)}</tbody>"
+            f"</table>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    # TERAPKAN FILTER TAMPILAN PADA TABEL
+    if filter_status == "⚠️ Hanya INVALID (Perlu Cek)":
+        df_tampil = df_ma[df_ma["Hasil Investigasi"] == "INVALID"].copy()
+    elif filter_status == "✅ Hanya VALID":
+        df_tampil = df_ma[df_ma["Hasil Investigasi"] == "VALID"].copy()
+    else:
+        df_tampil = df_ma.copy()
+
+    if df_tampil.empty:
+        st.info(f"Tidak ada data dengan status **{filter_status}**.")
+    else:
+        # Kunci urutan pengantar mengikuti sorting Invalid terbanyak dari df_summary
+        urutan_prioritas = df_summary["Petugas & Kantor"].tolist()
+        pengantar_aktif = set(df_tampil["pengantar_label"].dropna().unique())
+        pengantar_terfilter = [p for p in urutan_prioritas if p in pengantar_aktif]
+
+        WARNA_LIST = ["#002060", "#c00000"]
+
+        for idx_p, p_label in enumerate(pengantar_terfilter):
+            df_sub = df_tampil[df_tampil["pengantar_label"] == p_label]
+            if df_sub.empty:
+                continue
+
+            warna_hdr = WARNA_LIST[idx_p % 2]
+            render_tabel_kartu_ma(p_label, df_sub, header_bg=warna_hdr)
+
+            c_ai, c_edit = st.columns([1, 2])
+
+            # 1. TOMBOL PERIKSA AI GEMINI PER PENGANTAR
+            with c_ai:
+                if st.button(f"✨ Jalankan AI Gemini", key=f"btn_ai_{idx_p}"):
+                    total_resi = len(df_sub)
+                    prog_bar = st.progress(0)
+                    txt_status = st.empty()
+
+                    for c_idx, (_, r_data) in enumerate(df_sub.iterrows(), start=1):
+                        resi_curr = r_data["connote"]
+                        txt_status.caption(f"Memeriksa {resi_curr} ({c_idx}/{total_resi})...")
+                        f_target = r_data.get("foto_ktp")
+
+                        if not f_target:
+                            st_ai, al_ai = "INVALID", "Foto identitas nihil"
+                        else:
+                            is_v, alasan = analyze_document_with_gemini(f_target)
+                            st_ai = "VALID" if is_v else "INVALID"
+                            al_ai = alasan
+
+                        st.session_state["manual_overrides"][resi_curr] = {
+                            "status": st_ai,
+                            "ket": al_ai
+                        }
+                        st.session_state["audit_data"].loc[
+                            st.session_state["audit_data"]["connote"] == resi_curr,
+                            ["Hasil Investigasi", "Penjelasan Invalid"]
+                        ] = [st_ai, al_ai]
+
+                        prog_bar.progress(c_idx / total_resi)
+
+                    txt_status.empty()
+                    prog_bar.empty()
+                    st.success(f"Analisis Gemini untuk {p_label} selesai!")
+                    st.rerun()
+
+            # 2. KOREKSI STATUS MANUAL KHUSUS RESI PENGANTAR INI
+            with c_edit:
+                with st.expander(f"✍️ Koreksi Manual ({p_label})", expanded=False):
+                    list_resi_p = df_sub["connote"].tolist()
+                    resi_pilih = st.selectbox("Pilih Resi:", options=list_resi_p, key=f"sel_r_{idx_p}")
+
+                    data_resi_aktif = df_sub[df_sub["connote"] == resi_pilih].iloc[0]
+
+                    with st.form(key=f"form_koreksi_{idx_p}_{resi_pilih}"):
+                        ce1, ce2 = st.columns([1, 2])
+                        with ce1:
+                            st_edit = st.selectbox(
+                                "Status:",
+                                ["VALID", "INVALID"],
+                                index=0 if data_resi_aktif["Hasil Investigasi"] == "VALID" else 1
+                            )
+                        with ce2:
+                            ket_edit = st.text_input(
+                                "Keterangan Pengawas:",
+                                value=data_resi_aktif["Penjelasan Invalid"]
+                            )
+
+                        btn_simpan = st.form_submit_button("💾 Simpan Perubahan")
+
+                        if btn_simpan:
+                            st.session_state["manual_overrides"][resi_pilih] = {
+                                "status": st_edit,
+                                "ket": ket_edit
+                            }
+                            st.session_state["audit_data"].loc[
+                                st.session_state["audit_data"]["connote"] == resi_pilih,
+                                ["Hasil Investigasi", "Penjelasan Invalid"]
+                            ] = [st_edit, ket_edit]
+                            st.success(f"Resi {resi_pilih} berhasil diperbarui!")
+                            st.rerun()
+
+            st.markdown("<div style='margin-bottom: 25px;'></div>", unsafe_allow_html=True)
+
+   # Unduh Berita Acara PDF Resmi
+    st.markdown("<br>", unsafe_allow_html=True)
+    pdf_bytes = generate_pdf_berita_acara(df_ma, d_start, d_end)
+    st.download_button(
+        label="📄 Unduh Berita Acara Uji Petik (PDF Resmi)",
+        data=pdf_bytes,
+        file_name=f"Berita_Acara_Uji_Petik_MA_{d_start}_{d_end}.pdf",
+        mime="application/pdf"
     )
-
-with c5:
-    render_metric_card(
-        title="Di Luar Kendali",
-        value=total_luar,
-        badge_text="Luar Wilayah (Hari Ini)",
-        badge_bg="#f1f5f9",
-        badge_color="#475569",
-        card_border="#cbd5e1",
-        icon_char="🔴"
-    )
-
-st.markdown("<br>", unsafe_allow_html=True)
-
-# --- GRAFIK (NAVY BLUE) ---
-g1, g2 = st.columns(2)
-with g1:
-    st.subheader("📊 Distribusi Posisi Kiriman")
-    kendali_summary = df_filtered["Kendali"].value_counts().reset_index()
-    kendali_summary.columns = ["Status Kendali", "Jumlah"]
-    st.bar_chart(
-        kendali_summary.set_index("Status Kendali"),
-        color="#002060"
-    )
-
-with g2:
-    st.subheader("🏢 Sebaran Kiriman per KC/KCP Terkini")
-    loc_summary = df_filtered["KC/KCP"].value_counts().head(10).reset_index()
-    loc_summary.columns = ["KC/KCP", "Jumlah"]
-    st.bar_chart(
-        loc_summary.set_index("KC/KCP"),
-        color="#002060"
-    )
-
-st.markdown("---")
-
-# ========================================================
-# BAGIAN KARTU TABEL PER PENGANTAR (SIAP SCREENSHOT)
-# ========================================================
-st.subheader("📸 Format Tabel per Petugas Pengantar (Siap Screenshot)")
-
-unique_couriers = [p for p in df_filtered["Petugas Update"].dropna().unique().tolist() if p != "-"]
-
-WARNA_LIST = ["#002060", "#c00000"]
-
-mode_tampilan = st.radio(
-    "Pilihan Tampilan:",
-    ["Semua Petugas Sekaligus", "Pilih 1 Petugas Tertentu"],
-    horizontal=True
-)
-
-if mode_tampilan == "Pilih 1 Petugas Tertentu":
-    pilih_petugas = st.selectbox("Pilih Petugas yang Ingin Ditampilkan:", unique_couriers)
-    if pilih_petugas:
-        df_sub = df_filtered[df_filtered["Petugas Update"] == pilih_petugas]
-        render_screenshot_card(pilih_petugas, df_sub, header_bg="#002060")
-else:
-    if not unique_couriers:
-        st.info("Tidak ada petugas yang terdaftar di data saat ini.")
-    for idx, courier in enumerate(unique_couriers):
-        warna_header = WARNA_LIST[idx % 2]
-        df_sub = df_filtered[df_filtered["Petugas Update"] == courier]
-        render_screenshot_card(courier, df_sub, header_bg=warna_header)
-
-st.markdown("---")
-
-# ========================================================
-# TABEL RINCIAN LENGKAP UTAMA (KLIK CONNOTE ASLI DENGAN PID)
-# ========================================================
-st.subheader("📋 Daftar Rincian Kiriman (Keseluruhan)")
-
-search_kw = st.text_input("🔍 Cari Resi, Penerima, KC/KCP, atau Petugas:", placeholder="Ketik kata kunci pencarian...")
-if search_kw:
-    kw = search_kw.lower()
-    cols_search = ["connote", "Penerima", "Alamat", "KC/KCP", "Petugas Update", "Status SLA"]
-    df_filtered = df_filtered[
-        df_filtered[cols_search].astype(str).apply(lambda row: row.str.lower().str.contains(kw)).any(axis=1)
-    ]
-
-# Buat nomor urut
-df_filtered = df_filtered.reset_index(drop=True)
-df_filtered.insert(0, "nomor", df_filtered.index + 1)
-
-# Format kolom connote menjadi teks resi asli yang dibungkus tag <a>
-df_display = df_filtered.copy()
-df_display["connote"] = df_display.apply(
-    lambda r: f'<a href="{r["url_lacak"]}" target="_blank" style="color: #002060; font-weight: bold; text-decoration: underline;">{r["connote"]}</a>' 
-    if r["url_lacak"] else r["connote"], 
-    axis=1
-)
-
-cols_to_render = [
-    "nomor",
-    "connote",
-    "KC/KCP",
-    "Petugas Update",
-    "Status SLA",
-    "Tgl Jatuh Tempo",
-    "Tgl Update",
-    "Status",
-    "Layanan",
-    "Penerima",
-    "Alamat",
-    "First Attempt",
-    "Alasan Gagal Antar",
-    "Irregularity",
-    "Kendali"
-]
-
-cols_valid = [c for c in cols_to_render if c in df_display.columns]
-
-# Render tabel HTML responsif dengan sticky header dan horizontal scroll
-table_html = df_display[cols_valid].to_html(escape=False, index=False)
-st.markdown(
-    f"""
-    <div style="max-height: 480px; overflow-y: auto; overflow-x: auto; border: 1px solid #cbd5e1; border-radius: 8px; margin-bottom: 20px;">
-        <style>
-            .dataframe {{ width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif; font-size: 13px; }}
-            .dataframe th {{ background-color: #f1f5f9; color: #334155; position: sticky; top: 0; padding: 10px 8px; border-bottom: 2px solid #cbd5e1; z-index: 1; text-align: left; }}
-            .dataframe td {{ padding: 8px 8px; border-bottom: 1px solid #e2e8f0; white-space: nowrap; }}
-            .dataframe tr:hover {{ background-color: #f8fafc; }}
-        </style>
-        {table_html}
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-# Export CSV (menggunakan nomor resi asli teks murni tanpa link)
-df_export = df_filtered.copy()
-if "url_lacak" in df_export.columns:
-    df_export = df_export.drop(columns=["url_lacak"])
-
-csv_bytes = df_export.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="📥 Unduh Data (CSV)",
-    data=csv_bytes,
-    file_name=f"jatuh_tempo_{kc_input}_{tgl_hari_ini}.csv",
-    mime="text/csv"
-)
