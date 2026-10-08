@@ -252,26 +252,6 @@ def evaluate_connote_photos_cached(connote_id: str, f1_url: str, f2_url: str) ->
 # ========================================================
 # 2. VERIFIKASI DOKUMEN DENGAN GEMINI AI (TAHAP 2)
 # ========================================================
-@st.cache_data(ttl=3600)
-def get_active_gemini_model(api_key: str) -> str:
-    """Mengambil otomatis model multimodal yang aktif di akun API key."""
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            models = [m.get("name", "") for m in res.json().get("models", [])]
-            # Prioritaskan flash terbaru yang mendukung generateContent
-            for target in ["models/gemini-2.0-flash", "models/gemini-1.5-flash", "models/gemini-1.5-flash-latest", "models/gemini-1.5-pro"]:
-                if target in models:
-                    return target.replace("models/", "")
-            for m in models:
-                if "flash" in m and "generateContent" in str(res.json()):
-                    return m.replace("models/", "")
-    except Exception:
-        pass
-    return "gemini-2.0-flash"
-
-
 def analyze_document_with_gemini(img_url: str) -> tuple:
     api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
     if not api_key:
