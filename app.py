@@ -845,7 +845,44 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     st.markdown("---")
     st.subheader("📸 Format Tabel Uji Petik per Petugas Pengantar (Siap Screenshot)")
 
-    
+    def render_tabel_kartu_ma(header_label: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
+        table_rows = []
+        for idx, (_, row) in enumerate(group_df.iterrows(), start=1):
+            r_link = f"<a href='{row['url_lacak']}' target='_blank' style='color:#002060; font-weight:bold; text-decoration:underline;'>{row['connote']}</a>" if row['url_lacak'] else row['connote']
+            coord_link = f"<a href='{row['url_maps']}' target='_blank' style='color:#16a34a; font-weight:bold; text-decoration:underline;'>📍 {row['koordinat']}</a>" if row['url_maps'] else "-"
+            img_orang = f"<a href='{row['foto_orang']}' target='_blank'><img src='{row['foto_orang']}' style='width: 105px; height: 115px; object-fit: cover; border-radius: 6px; border: 1.5px solid #cbd5e1;'></a>" if row['foto_orang'] else "<span style='color:#94a3b8; font-size:11px;'>Tidak ada foto</span>"
+            img_ktp = f"<a href='{row['foto_ktp']}' target='_blank'><img src='{row['foto_ktp']}' style='width: 155px; height: 105px; object-fit: cover; border-radius: 6px; border: 1.5px solid #cbd5e1;'></a>" if row['foto_ktp'] else "<span style='color:#dc2626; font-size:11px; font-weight:bold;'>Tidak ada KTP/KK</span>"
+
+            is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
+            badge_inv = '<div style="background-color: #86efac; color: #065f46; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #4ade80;">VALID</div>' if is_valid else '<div style="background-color: #fca5a5; color: #991b1b; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #f87171;">INVALID</div>'
+            ket_txt = row["Penjelasan Invalid"] if str(row["Penjelasan Invalid"]).strip() else "-"
+
+            table_rows.append(
+                f"<tr style='border-bottom: 1px solid #cbd5e1; background-color: #ffffff; font-size: 13px;'>"
+                f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
+                f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
+                f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
+                f"<td style='padding: 10px 8px; border-right: 1px solid #e2e8f0;'><b>{row['nama penerima']}</b><br><span style='color: #64748b; font-size: 11px;'>{row['alamat penerima']}</span></td>"
+                f"<td style='padding: 10px 8px; white-space: nowrap; text-align: center; border-right: 1px solid #e2e8f0;'>{coord_link}</td>"
+                f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_orang}</td>"
+                f"<td style='padding: 8px; text-align: center; border-right: 1px solid #e2e8f0;'>{img_ktp}</td>"
+                f"<td style='padding: 10px 8px; text-align: center; min-width: 100px; border-right: 1px solid #e2e8f0;'>{badge_inv}</td>"
+                f"<td style='padding: 10px 10px; color: #334155; font-weight: 600; font-size: 12px; min-width: 160px;'>{ket_txt}</td>"
+                f"</tr>"
+            )
+
+        st.markdown(
+            f"<div style='margin-bottom: 12px; border-radius: 6px; overflow: hidden; box-shadow: 0 2px 6px rgba(0,0,0,0.12); border: 1px solid #94a3b8;'>"
+            f"<div style='background-color: #ffffff; color: #000000; text-align: center; padding: 10px 6px; font-size: 16px; font-weight: 900; letter-spacing: 0.5px; border-bottom: 2px solid #111;'>{header_label}</div>"
+            f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
+            f"<thead><tr style='background-color: {header_bg}; color: #ffffff; font-size: 13px; text-align: center;'>"
+            f"<th style='padding: 10px 6px;'>NO</th><th>Nomor Resi</th><th>Status Kiriman</th><th>Penerima & Alamat</th><th>Koordinat</th><th>Foto Orang</th><th>Foto KTP / KK</th><th>Status</th><th>Keterangan Pengawas</th>"
+            f"</tr></thead>"
+            f"<tbody>{''.join(table_rows)}</tbody>"
+            f"</table>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
 
     # TERAPKAN FILTER TAMPILAN PADA TABEL
     if filter_status == "⚠️ Hanya INVALID (Perlu Cek)":
@@ -870,8 +907,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             if df_sub.empty:
                 continue
 
-            warna_hdr = "#002060" # atau sesuaikan dengan logika warna Anda
-
+            warna_hdr = WARNA_LIST[idx_p % 2]
             render_tabel_kartu_ma(p_label, df_sub, header_bg=warna_hdr)
 
             c_ai, c_edit = st.columns([1, 2])
