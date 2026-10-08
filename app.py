@@ -12,10 +12,6 @@ import requests
 import streamlit as st
 import urllib3
 
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
 import io
 
 # OCR bersifat OPSIONAL: jika tidak terpasang, algoritma lama tetap jalan
