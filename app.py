@@ -294,7 +294,7 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
         return (False, "API Key belum disetel di Secrets")
 
     try:
-        # 1. Unduh dan perkecil ukuran gambar
+        # 1. Unduh dan perkecil gambar
         resp_img = requests.get(img_url, timeout=12, verify=False)
         if resp_img.status_code != 200:
             return (False, "Gagal mengunduh gambar")
@@ -328,8 +328,37 @@ def analyze_document_with_gemini(img_url: str) -> tuple:
             }
         }
 
-        # 2. Pakai endpoint resmi gemini-1.5-flash (pasti aktif di semua akun)
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        # 2. Cek otomatis model mana yang diizinkan oleh API Key Anda
+        url_list = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        res_list = requests.get(url_list, timeout=10)
+        
+        target_model_name = ""
+        if res_list.status_code == 200:
+            models_data = res_list.json().get("models", [])
+            # Ambil semua model yang mendukung fungsi generateContent
+            tersedia = [
+                m["name"] for m in models_data 
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+            # Prioritaskan varian flash/multimodal yang aktif
+            for preferred in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash-exp"]:
+                for t in tersedia:
+                    if preferred in t:
+                        target_model_name = t
+                        break
+                if target_model_name:
+                    break
+            
+            # Jika tidak ada yang cocok, gunakan model pertama yang tersedia
+            if not target_model_name and tersedia:
+                target_model_name = tersedia[0]
+
+        # Fallback jika list gagal diambil
+        if not target_model_name:
+            target_model_name = "models/gemini-2.0-flash"
+
+        # 3. Tembak endpoint dengan nama model resmi yang sudah diverifikasi ada
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/{target_model_name}:generateContent?key={api_key}"
         resp = requests.post(api_url, headers=headers, json=payload, timeout=25)
 
         if resp.status_code != 200:
