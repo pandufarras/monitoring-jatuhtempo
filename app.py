@@ -845,7 +845,7 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
     st.markdown("---")
     st.subheader("📸 Format Tabel Uji Petik per Petugas Pengantar (Siap Screenshot)")
 
-    def render_tabel_kartu_ma(header_label: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
+   def render_tabel_kartu_ma(header_label: str, group_df: pd.DataFrame, header_bg: str = "#002060"):
         table_rows = []
         for idx, (_, row) in enumerate(group_df.iterrows(), start=1):
             r_link = f"<a href='{row['url_lacak']}' target='_blank' style='color:#002060; font-weight:bold; text-decoration:underline;'>{row['connote']}</a>" if row['url_lacak'] else row['connote']
@@ -854,11 +854,16 @@ elif menu_pilihan == "⚖️ Uji Petik Mahkamah Agung (PA/PN)":
             img_ktp = f"<a href='{row['foto_ktp']}' target='_blank'><img src='{row['foto_ktp']}' style='width: 155px; height: 105px; object-fit: cover; border-radius: 6px; border: 1.5px solid #cbd5e1;'></a>" if row['foto_ktp'] else "<span style='color:#dc2626; font-size:11px; font-weight:bold;'>Tidak ada KTP/KK</span>"
 
             is_valid = (str(row["Hasil Investigasi"]).strip().upper() == "VALID")
+            
+            # ATUR WARNA BACKGROUND: Merah muda lembut (#fef2f2) jika INVALID, putih (#ffffff) jika VALID
+            bg_row_color = "#ffffff" if is_valid else "#fef2f2"
+            border_row_color = "#cbd5e1" if is_valid else "#fecaca"
+
             badge_inv = '<div style="background-color: #86efac; color: #065f46; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #4ade80;">VALID</div>' if is_valid else '<div style="background-color: #fca5a5; color: #991b1b; font-weight: 800; text-align: center; padding: 6px 10px; border-radius: 6px; font-size: 12px; border: 1px solid #f87171;">INVALID</div>'
             ket_txt = row["Penjelasan Invalid"] if str(row["Penjelasan Invalid"]).strip() else "-"
 
             table_rows.append(
-                f"<tr style='border-bottom: 1px solid #cbd5e1; background-color: #ffffff; font-size: 13px;'>"
+                f"<tr style='border-bottom: 1px solid {border_row_color}; background-color: {bg_row_color}; font-size: 13px;'>"
                 f"<td style='padding: 10px 6px; text-align: center; font-weight: bold; border-right: 1px solid #e2e8f0;'>{idx}</td>"
                 f"<td style='padding: 10px 8px; white-space: nowrap; border-right: 1px solid #e2e8f0;'>{r_link}</td>"
                 f"<td style='padding: 10px 8px; font-weight: 600; border-right: 1px solid #e2e8f0;'>{row['status kiriman']}</td>"
