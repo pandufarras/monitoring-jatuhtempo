@@ -541,7 +541,7 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
     with c4: render_metric_card("Dalam Kendali (692xx)", t_dalam, "Di UPT KC/KCP", "#dcfce7", "#15803d", "#86efac", "🟢")
     with c5: render_metric_card("Di Luar Kendali", t_luar, "Luar Wilayah", "#f1f5f9", "#475569", "#cbd5e1", "🔴")
 
-   st.markdown("---")
+    st.markdown("---")
     colors = ["#002060", "#c00000"]
 
     def render_tabel_jt(judul: str, df_data: pd.DataFrame, bg_color: str):
