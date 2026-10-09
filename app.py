@@ -541,17 +541,13 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
     with c4: render_metric_card("Dalam Kendali (692xx)", t_dalam, "Di UPT KC/KCP", "#dcfce7", "#15803d", "#86efac", "🟢")
     with c5: render_metric_card("Di Luar Kendali", t_luar, "Luar Wilayah", "#f1f5f9", "#475569", "#cbd5e1", "🔴")
 
-    st.markdown("---")
-    st.subheader("📸 Format Tabel per Petugas Pengantar (Siap Screenshot)")
-
-    couriers = [p for p in df_jt["Petugas Update"].dropna().unique() if p != "-"]
+   st.markdown("---")
     colors = ["#002060", "#c00000"]
 
-    for idx, courier in enumerate(couriers):
-        df_sub = df_jt[df_jt["Petugas Update"] == courier]
+    def render_tabel_jt(judul: str, df_data: pd.DataFrame, bg_color: str):
         tbody_rows = []
-        for _, r in df_sub.iterrows():
-            sla_c = "#b30000" if r['Status SLA'] == "Over SLA" else "#d97706"
+        for _, r in df_data.iterrows():
+            sla_c = "#b30000" if r["Status SLA"] == "Over SLA" else "#d97706"
             tbody_rows.append(
                 f"<tr style='border-bottom: 1px solid #ddd; font-size: 13px;'>"
                 f"<td style='padding: 8px 10px;'><a href='{r['url_lacak']}' target='_blank' style='color:#002060; font-weight:bold; text-decoration:underline;'>{r['connote']}</a></td>"
@@ -568,9 +564,9 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
 
         st.markdown(
             f"<div style='margin-bottom: 25px; border-radius: 6px; overflow: hidden; border: 1px solid #94a3b8; box-shadow: 0 1px 4px rgba(0,0,0,0.1);'>"
-            f"<div style='background-color: #ffffff; text-align: center; padding: 8px; font-size: 17px; font-weight: 900; border-bottom: 2px solid #111;'>{courier}</div>"
+            f"<div style='background-color: #ffffff; text-align: center; padding: 8px; font-size: 17px; font-weight: 900; border-bottom: 2px solid #111;'>{judul}</div>"
             f"<table style='width: 100%; border-collapse: collapse; font-family: sans-serif;'>"
-            f"<thead><tr style='background-color: {colors[idx % 2]}; color: #ffffff; font-size: 13px; text-align: center;'>"
+            f"<thead><tr style='background-color: {bg_color}; color: #ffffff; font-size: 13px; text-align: center;'>"
             f"<th style='padding: 8px;'>Nomor Resi</th><th>Kantor Update</th><th>Tgl Update</th><th>Petugas Update</th><th>Status</th><th>Produk</th><th>Status SLA</th><th>Penerima</th><th>Alamat</th>"
             f"</tr></thead>"
             f"<tbody>{''.join(tbody_rows)}</tbody>"
@@ -579,6 +575,28 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
             unsafe_allow_html=True
         )
 
+    # 1. Bagian Dalam Kendali (per Petugas Update)
+    st.subheader("🟢 Kiriman Dalam Kendali (per Petugas)")
+    df_dalam_kendali = df_jt[df_jt["Kendali"] == "Dalam Kendali"]
+
+    if df_dalam_kendali.empty:
+        st.info("Tidak ada kiriman jatuh tempo dalam kendali.")
+    else:
+        couriers = [p for p in df_dalam_kendali["Petugas Update"].dropna().unique() if p != "-"]
+        for idx, courier in enumerate(couriers):
+            df_sub = df_dalam_kendali[df_dalam_kendali["Petugas Update"] == courier]
+            render_tabel_jt(courier, df_sub, colors[idx % 2])
+
+    st.markdown("---")
+
+    # 2. Bagian Di Luar Kendali (1 Tabel Gabungan)
+    st.subheader("🔴 Kiriman Di Luar Kendali")
+    df_luar_kendali = df_jt[df_jt["Kendali"] == "Di Luar Kendali"]
+
+    if df_luar_kendali.empty:
+        st.info("Tidak ada kiriman jatuh tempo di luar kendali.")
+    else:
+        render_tabel_jt("KIRIMAN DI LUAR KENDALI (UPT LAIN / TRANSIT)", df_luar_kendali, "#475569")
 
 # ==============================================================================
 # MENU 2: UJI PETIK MAHKAMAH AGUNG (PA / PN)
