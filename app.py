@@ -427,11 +427,16 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
     kc_input = st.sidebar.text_input("KC Tujuan", value="69200")
     tgl_h6 = tgl_hari_ini - datetime.timedelta(days=6)
 
+    # Deteksi hari Sabtu (weekday() == 5: Senin=0, ..., Sabtu=5, Minggu=6)
+    is_sabtu = (tgl_hari_ini.weekday() == 5)
+    tgl_akhir_periode = tgl_hari_ini + datetime.timedelta(days=1) if is_sabtu else tgl_hari_ini
+    info_periode_tambahan = " <span style='color: #0284c7; font-weight: bold;'>(+ Gabung Minggu)</span>" if is_sabtu else ""
+
     st.sidebar.markdown(
         f"""
         <div style="background-color: #f8fafc; border-left: 3px solid #0284c7; border-radius: 6px; padding: 10px; font-size: 12px; margin-top: 10px; color: #334155;">
             <div style="font-weight: 700; margin-bottom: 4px; color: #0369a1;">📌 Periode Pemantauan:</div>
-            <div><b>{tgl_h6.strftime('%d/%m/%Y')}</b> s.d. <b>{tgl_hari_ini.strftime('%d/%m/%Y')}</b></div>
+            <div><b>{tgl_h6.strftime('%d/%m/%Y')}</b> s.d. <b>{tgl_akhir_periode.strftime('%d/%m/%Y')}</b>{info_periode_tambahan}</div>
         </div>
         """,
         unsafe_allow_html=True
@@ -478,7 +483,14 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
     @st.cache_data(ttl=120)
     def fetch_data_jt(kc_code: str, target_date: datetime.date) -> pd.DataFrame:
         start_date = target_date - datetime.timedelta(days=6)
-        payload = build_payload_jt(kc_code, start_date, target_date)
+        
+        # Rule tambahan: Jika hari Sabtu, end_date diperpanjang hingga Minggu (+1 hari)
+        if target_date.weekday() == 5:
+            end_date = target_date + datetime.timedelta(days=1)
+        else:
+            end_date = target_date
+
+        payload = build_payload_jt(kc_code, start_date, end_date)
         try:
             resp = requests.post(URL_ES, headers=HEADERS_ES, auth=AUTH_ES, json=payload, verify=False, timeout=35)
         except Exception as e:
@@ -522,7 +534,10 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
     with st.spinner("Memuat data jatuh tempo..."):
         df_jt = fetch_data_jt(kc_input, tgl_hari_ini)
 
-    st.caption(f"Wilayah KC: **{kc_input}** | Periode: **{tgl_h6.strftime('%d/%m/%Y')}** s.d. **{tgl_hari_ini.strftime('%d/%m/%Y')}**")
+    caption_info = f"Wilayah KC: **{kc_input}** | Periode: **{tgl_h6.strftime('%d/%m/%Y')}** s.d. **{tgl_akhir_periode.strftime('%d/%m/%Y')}**"
+    if is_sabtu:
+        caption_info += " *(Khusus hari Sabtu: kiriman jatuh tempo Minggu otomatis digabung)*"
+    st.caption(caption_info)
 
     if df_jt.empty:
         st.warning("Tidak ada kiriman jatuh tempo pada periode ini.")
@@ -534,10 +549,12 @@ if menu_pilihan == "📦 Monitoring Jatuh Tempo":
     t_dalam = len(df_jt[df_jt["Kendali"] == "Dalam Kendali"])
     t_luar = len(df_jt[df_jt["Kendali"] == "Di Luar Kendali"])
 
+    badge_jt_label = f"↑ {t_jt_today} deadline Sabtu + Minggu" if is_sabtu else f"↑ {t_jt_today} deadline hari ini"
+
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: render_metric_card("Total Resi Terpantau", t_item, "Periode H s.d. H-6", "#e2e8f0", "#334155", "#cbd5e1", "📦")
     with c2: render_metric_card("Over SLA", t_over, f"↑ {t_over} lewat deadline", "#fee2e2", "#b91c1c", "#fca5a5", "🚨")
-    with c3: render_metric_card("Jatuh Tempo Hari Ini", t_jt_today, f"↑ {t_jt_today} deadline hari ini", "#fef3c7", "#b45309", "#fcd34d", "⏳")
+    with c3: render_metric_card("Jatuh Tempo Hari Ini", t_jt_today, badge_jt_label, "#fef3c7", "#b45309", "#fcd34d", "⏳")
     with c4: render_metric_card("Dalam Kendali (692xx)", t_dalam, "Di UPT KC/KCP", "#dcfce7", "#15803d", "#86efac", "🟢")
     with c5: render_metric_card("Di Luar Kendali", t_luar, "Luar Wilayah", "#f1f5f9", "#475569", "#cbd5e1", "🔴")
 
